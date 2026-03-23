@@ -1,0 +1,32 @@
+
+[[monitor]]
+name = "infra"
+type = "group"
+
+[[monitor]]
+name = "ap1"
+description = "Access point"
+type = "http"
+url = "http://ap1.example.com"
+maxredirects = 3
+interval = 180
+timeout = 10
+tags = ["infra","ap"]
+group = "infra"
+#notificationIDList = ["1","2"]
+#headers = '{ "Accept": "application/json" }'
+accepted_statuscodes = ['200']
+authMethod = 'basic'
+basic_auth_user = 'user'
+basic_auth_pass = 'password'
+
+[[monitor]]
+name = "site 1"
+description = "site test 1"
+type = "ping"
+hostname = "site1.example.com"
+maxredirects = 3
+interval = 60
+timeout = 10
+tags = ["servers"]
+group="servers"
