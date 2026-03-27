@@ -23,8 +23,10 @@ try:
 except Exception:
   print('Missing UptimeKumaApi, pip install --break-system-packages uptime-kuma-api')
 
+
 class ConfigError(Exception):
   pass
+
 
 # variables
 logger = logging.getLogger(__name__)
@@ -175,11 +177,11 @@ def create_update_notification(api: UptimeKumaApi = None, config=None, dry_run: 
 
 
 def process_notifications(api: UptimeKumaApi = None, existing_notifications: list[Dict[str, Any]] = None,
-                          config_notifications: Dict[str, Any] = None, delete: bool = False) -> list(dict()):
+                          config_notifications: list[Dict[str, Any]] = None, delete: bool = False) -> dict[Any, dict[str, Any] | Any]:
   new_notifications = {}
   existing_notifications_names = {e['name']: e for e in existing_notifications}
-  config_notifications_names = set(e['name'] for e in config_notifications )
-  config_notifications_dict = {e['name']:e for e in config_notifications }
+  config_notifications_names = set(e['name'] for e in config_notifications)
+  config_notifications_dict = {e['name']: e for e in config_notifications}
   logger.debug(f'existing_notifications: {existing_notifications}')
   logger.info(f'existing_notifications: {len(existing_notifications)}, names: {existing_notifications_names}')
 
@@ -189,7 +191,7 @@ def process_notifications(api: UptimeKumaApi = None, existing_notifications: lis
 
   to_delete = set(existing_notifications_names.keys()) - config_notifications_names
   to_add = config_notifications_names - set(existing_notifications_names.keys())
-  to_edit  = config_notifications_names & set(existing_notifications_names.keys())
+  to_edit = config_notifications_names & set(existing_notifications_names.keys())
 
   logger.debug(f'notifications: deletion requested: {delete}, to_delete: {to_delete}, to_add: {to_add}')
 
@@ -206,26 +208,28 @@ def process_notifications(api: UptimeKumaApi = None, existing_notifications: lis
   #edit notification
   for n in to_edit:
     payload = config_notifications_dict[n]
-    existing_notification=existing_notifications_names[n]
+    existing_notification = existing_notifications_names[n]
     logger.debug(f"Edited notification '{n}', id: {existing_notification} ,payload: {payload}")
-    result = api.edit_notification(id_=existing_notification['id'],**payload)
+    result = api.edit_notification(id_=existing_notification['id'], **payload)
     logger.info(f"Edited notification '{n}', msg: {result['msg']}'")
     logger.debug(f"Edited notification '{n}', result: {result}")
     actions['edited'].append(n)
 
     #delete notifications
   if delete and len(to_delete) > 0:
-      for n in to_delete:
-        id = existing_notifications[n]['id']
-        result = api.delete_notification(id_=n['id'])
-        logger.info(f"Deleted group '{n}', id: '{id}', msg: {result['msg']}")
-        logger.debug(f"Deleted new group '{n}, result: {result}'")
-        #remove deleted group
-        existing_notifications.pop(n)
-        actions['deleted'].append(n)
+    for n in to_delete:
+      id = existing_notifications[n]['id']
+      result = api.delete_notification(id_=n['id'])
+      logger.info(f"Deleted group '{n}', id: '{id}', msg: {result['msg']}")
+      logger.debug(f"Deleted new group '{n}, result: {result}'")
+      #remove deleted group
+      existing_notifications.pop(n)
+      actions['deleted'].append(n)
 
-  logger.debug(f'edited: {len(actions["edited"])}, {actions["edited"]}, added: {len(actions["added"])}, {actions["added"]}, deleted: {len(actions["deleted"])}, {actions["deleted"]}')
-  return {n['name']:n for n in existing_notifications}
+  logger.debug(
+    f'edited: {len(actions["edited"])}, {actions["edited"]}, added: {len(actions["added"])}, {actions["added"]}, deleted: {len(actions["deleted"])}, {actions["deleted"]}')
+  return {n['name']: n for n in existing_notifications}
+
 
 def process_groups(api: UptimeKumaApi = None, existing_groups=None, config_groups=None, delete: bool = False) -> dict:
   """
@@ -289,12 +293,12 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
   logger.debug(f'existing_groups: {existing_groups}')
   logger.info(f'existing_groups: {len(existing_groups)}')
 
-  # Notifications
+  # add/remove/edit Notifications
   existing_notifications = api.get_notifications()
   new_notifications = process_notifications(api=api, existing_notifications=existing_notifications,
                                             config_notifications=config_notifications, delete=delete)
 
-  # Groups
+  # add/remove Groups
   config_groups = set([g['group'] for g in config_monitors if 'group' in g.keys()])
   new_groups = process_groups(api=api, existing_groups=existing_groups, config_groups=config_groups, delete=delete)
 
@@ -307,7 +311,8 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
       logger.debug(f'monitor m: {m}')
       id_tags = []
       name = m["name"]
-      toml_tags = m["tags"]
+      monitor_toml_tags = m["tags"]
+      # replace notification name with ids
       new_notification_ids_list = []
       for notif in m["notificationIDList"]:
         m["notificationIDList"].remove(notif)
@@ -315,25 +320,26 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
       m["notificationIDList"] = new_notification_ids_list
       payload = normalize_monitor_for_api(m)
 
-      #add group if required
+      # add group if required
       if 'group' in m.keys():
-        #add the new group id to current monitor
+        #add the new group id to current monitor, parent is the attribute name
         payload['parent'] = new_groups[m['group']]['id']
         logger.debug(f"adding parent '{m['group']}' to {name}")
+      # group is not a monitor attribute
+      payload.pop("group", None)
 
-      # add tags to monitor
+      # create missing tags in kuma
       tags_name_in_kuma = [t for t in existing_tags]
-      logger.debug(f'tags_name: {tags_name_in_kuma}, toml_tags: {toml_tags}, existing_tags: {existing_tags}')
+      logger.debug(f'tags_name: {tags_name_in_kuma}, monitor_toml_tags: {monitor_toml_tags}, existing_tags: {existing_tags}')
 
-      for tag in toml_tags:
+      for tag in monitor_toml_tags:
         if tag not in tags_name_in_kuma:
           result = api.add_tag(name=tag, color="#{:06x}".format(random.randint(0, 0xFFFFFF)))
           logger.info(f"tag created '{tag}'")
           logger.debug(f"tag created '{tag}', result: {result}")
           existing_tags[tag] = {'name': tag, 'id': result['id']}
-      #remove tags from payload, handle in another function
+      # add monitor does not accept tags,remove tags from payload, will be handled in process_existing_tags
       payload.pop("tags", None)
-      payload.pop("group", None)
 
       if dry_run:
         if name in existing_monitors:
@@ -366,61 +372,75 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
       logger.debug(f'result: {result}, id_tags: {id_tags}')
 
       # handle tags
-      # update tags list with updated existing tags
-      tags_in_kuma = (next(iter(e)) for e in existing_tags)
-      logger.debug(f'tags_in_config: {tags_in_kuma}')
-
-      ids_to_add = []
-      ids_to_delete = []
-
-      kuma_monitor = api.get_monitor(id_=mon_id)
-      logger.debug(f'kuma_monitor: {kuma_monitor}')
-
-      #get id of tags defined in kuma
-      kuma_tags = []
-      for t in kuma_monitor['tags']:
-        kuma_tags.append(t['tag_id'])
-
-      # ge id of tags in toml
-      for t in m["tags"]:
-        if existing_tags[t]['id'] not in tags_in_kuma:
-          ids_to_add.append(existing_tags[t]['id'])
-      logger.debug(f'ids_to_add: {ids_to_add}')
-
-      #clean all defined tags to remove duplicate
-      deleted = []
-      for t in kuma_tags:
-        # delete all association
-        if t not in deleted:
-          result = api.delete_monitor_tag(tag_id=t, monitor_id=mon_id)
-          logger.debug(f"Deleted tag '{t}' on monitor {mon_id}")
-          deleted.append(t)
-        #tags association to recreate
-        if t not in ids_to_add:
-          ids_to_delete.append(t)
-
-      logger.debug(f'ids_to_add: {ids_to_add}, ids_to_delete: {ids_to_delete}, kuma_tags: {kuma_tags}')
-      # add tag-monitor association
-      for i in ids_to_add:
-        result = api.add_monitor_tag(tag_id=i, monitor_id=mon_id)
-        logger.info(f"Adding tag '{i}' to monitor {mon_id}, result: {result['msg']}")
-        logger.debug(f"Adding tag '{i}' to monitor {mon_id}, result: {result}")
-
-      # remove tag-monitor association.
-      for i in ids_to_delete:
-        if i not in deleted:
-          result = api.delete_monitor_tag(tag_id=i, monitor_id=mon_id)
-          logger.info(f"Deleting tag '{i}' to monitor {mon_id}, result: {result['msg']}")
-          logger.debug(f"Deleting tag '{i}' to monitor {mon_id}, result: {result}")
-
-      #remove unused tags
-      for d in deleted:
-        if d not in ids_to_add:
-          result = api.delete_tag(id_=d)
-          logger.debug(f"Deleting tag '{i}', result: {result}")
+      process_existing_tags(api=api, monitor_id = mon_id, monitor=m, existing_tags=existing_tags)
 
 
-def get_monitors(api: UptimeKumaApi | None) -> (list[dict[Any, Any]], dict[str, dict]):
+# handle tags
+def process_existing_tags(api:UptimeKumaApi = None, monitor_id:int = 0, monitor = None, existing_tags = None) -> None:
+  """
+  after monitor update, delete, add tags
+  :param api:
+  :param monitor:
+  :param existing_tags:
+  """
+  if monitor == None or existing_tags is None:
+    logger.warning(f'monitor or tags is none, nothing to proccess')
+
+  # update tags list with updated existing tags
+  tags_in_kuma = (next(iter(e)) for e in existing_tags)
+  logger.debug(f'tags_in_config: {tags_in_kuma}')
+
+  ids_to_add = []
+  ids_to_delete = []
+
+  kuma_monitor = api.get_monitor(id_=monitor_id)
+  logger.debug(f'kuma_monitor: {kuma_monitor}')
+
+  #get id of tags defined in kuma
+  kuma_tags = []
+  for t in kuma_monitor['tags']:
+    kuma_tags.append(t['tag_id'])
+
+  # ge id of tags in toml
+  for t in monitor["tags"]:
+    if existing_tags[t]['id'] not in tags_in_kuma:
+      ids_to_add.append(existing_tags[t]['id'])
+  logger.debug(f'ids_to_add: {ids_to_add}')
+
+  #clean all defined tags to remove duplicate
+  deleted = []
+  for t in kuma_tags:
+    # delete all association
+    if t not in deleted:
+      result = api.delete_monitor_tag(tag_id=t, monitor_id=monitor_id)
+      logger.debug(f"Deleted tag '{t}' on monitor {monitor_id}")
+      deleted.append(t)
+    #tags association to recreate
+    if t not in ids_to_add:
+      ids_to_delete.append(t)
+
+  logger.debug(f'ids_to_add: {ids_to_add}, ids_to_delete: {ids_to_delete}, kuma_tags: {kuma_tags}')
+  # add tag-monitor association
+  for i in ids_to_add:
+    result = api.add_monitor_tag(tag_id=i, monitor_id=monitor_id)
+    logger.info(f"Adding tag '{i}' to monitor {monitor_id}, result: {result['msg']}")
+    logger.debug(f"Adding tag '{i}' to monitor {monitor_id}, result: {result}")
+
+  # remove tag-monitor association.
+  for i in ids_to_delete:
+    if i not in deleted:
+      result = api.delete_monitor_tag(tag_id=i, monitor_id=monitor_id)
+      logger.info(f"Deleting tag '{i}' to monitor {monitor_id}, result: {result['msg']}")
+      logger.debug(f"Deleting tag '{i}' to monitor {monitor_id}, result: {result}")
+
+  #remove unused tags
+  for d in deleted:
+    if d not in ids_to_add:
+      result = api.delete_tag(id_=d)
+      logger.debug(f"Deleting tag '{i}', result: {result}")
+
+
+def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[str, dict]]:
   existing = {}
   try:
     existing_config = api.get_monitors()
