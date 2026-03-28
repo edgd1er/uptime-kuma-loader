@@ -4,13 +4,24 @@
 
 From toml file, create or update a uptime-kuma site.
 The script is based on uptime-kuma-api's module.
+elements not present in config (toml) or duplicate in database are deleted if -d argument is given.
 
-implemented:
+Implemented:
 * monitor
 * tags
 * groups
+* notification
 
-not implemented:
+Not implemented (planned):
+* status page
+* pause/resume
+* uptime
+* statistics
+* maintenance
+
+Not implemented (not planned):
+* proxy
+* api key
 * all the rest
 
 ## Syntax TOML to define monitors
@@ -23,58 +34,56 @@ Main points:
 - Comments supported with #.
 - Native types TOML : string, integer, boolean, array, table, multiline string ("""...""").
 
-Structure minimale d'un monitor
-- Chaque monitor doit contenir au minimum :
-  - name (string) — nom unique du monitor
-  - type (string) — un des types valides (voir Enum)
+Monitor's minimal fields:
+  * name (string) — monitor's unique name
+  * type (string) — one of the valid types (see [Enum](https://uptime-kuma-api.readthedocs.io/en/latest/api.html#uptime_kuma_api.AuthMethod))
 
-Minimal config
+```toml
 [[monitor]]
 name = "Monitor A"
 type = "HTTP"
+```
 
 Supported values are the one from the api: https://uptime-kuma-api.readthedocs.io/en/latest/api.html
 
-./kuma_load.py -a http://localhost:3001 -u admin -ppassword -v
-
-- name : string — nom du monitor (obligatoire)
-- type : string — type du monitor (obligatoire). Valeurs valides :
+- name : string — monitor's name (required)
+- type : string — monitor's name (required). Expected values:
   GROUP, HTTP, PORT, PING, KEYWORD, JSON_QUERY, GRPC_KEYWORD, DNS, DOCKER, REAL_BROWSER, PUSH, STEAM, GAMEDIG, MQTT, KAFKA_PRODUCER, SQLSERVER, POSTGRES, MYSQL, MONGODB, RADIUS, REDIS, TAILSCALE_PING
-- url : string — URL complète pour HTTP/REAL_BROWSER/JSON_QUERY
-- host : string — nom d'hôte ou adresse IP (PORT, PING, DNS, etc.)
-- port : integer — port réseau
-- interval : integer — intervalle en secondes
-- timeout : integer — timeout en secondes
+- url : string — complete URL for HTTP/REAL_BROWSER/JSON_QUERY
+- host : string — hostname or ip (PORT, PING, DNS, etc.)
+- port : integer — port
+- interval : integer — interval in seconds
+- timeout : integer — timeout in seconds
 - enabled : boolean — true/false
 - tags : array[string] — ex: ["prod","api"]
-- notification_ids : array[integer] — identifiants de notification
-- ignore_ssl : boolean — ignorer erreur certificat (HTTP/REAL_BROWSER)
+- notification_ids : array[integer] — notification ids
+- ignore_ssl : boolean — ignore certificats error (HTTP/REAL_BROWSER)
 - http_method : string — "GET","POST",...
-- http_headers : table — paires clé=valeur, ex: http_headers = { Authorization = "Bearer abc", Accept = "application/json" }
-- http_body : string (peut être multiline) — corps pour POST/PUT
-- auth_method : string — méthode d'authentification. Valeurs valides : NONE, HTTP_BASIC, NTLM, MTLS, OAUTH2_CC
-- username : string — pour HTTP_BASIC/NTLM
-- password : string — pour HTTP_BASIC/NTLM
-- oauth2_token_url : string — pour OAUTH2_CC
+- http_headers : table — keys, values, ex: http_headers = { Authorization = "Bearer abc", Accept = "application/json" }
+- http_body : string (peut être multiline) — body for POST/PUT
+- auth_method : string — authentification method: expected values: NONE, HTTP_BASIC, NTLM, MTLS, OAUTH2_CC
+- username : string — for HTTP_BASIC/NTLM
+- password : string — for HTTP_BASIC/NTLM
+- oauth2_token_url : string — for OAUTH2_CC
 - oauth2_client_id : string
 - oauth2_client_secret : string
-- keyword : string — mot/clause recherché (KEYWORD, GRPC_KEYWORD)
-- json_path : string — chemin JSON à interroger (JSON_QUERY)
-- expected_status : integer — code HTTP attendu
-- expected_text : string — texte attendu dans la réponse
-- group_id : integer — id du groupe parent (GROUP)
-- heartbeat_url : string — pour PUSH monitors
-- steam_appid : integer — pour STEAM
-- docker_host : string — hôte docker (DOCKER)
-- maintenance_ids : array[integer] — ids de maintenance
-- notes : string (multiline autorisé)
-- custom_fields : table — paires nom=valeur custom
+- keyword : string — searched word phrase (KEYWORD, GRPC_KEYWORD)
+- json_path : string — JSON path to query (JSON_QUERY)
+- expected_status : integer — expected HTTP code
+- expected_text : string — expected text in body's response
+- group_id : integer — parent group's id (GROUP)
+- heartbeat_url : string — for PUSH monitors
+- steam_appid : integer — for STEAM
+- docker_host : string — docker host (DOCKER)
+- maintenance_ids : array[integer] — maintenance ids
+- notes : string (multiline allowed)
+- custom_fields : table — k,v pairs name=valeur
 
-Représentation TOML recommandée
+TOML monitor config example:
 
-- Définir plusieurs monitors :
+```toml
 [[monitor]]
-name = "Site principal"
+name = "main site"
 type = "HTTP"
 url = "https://example.com/health"
 interval = 60
@@ -86,14 +95,13 @@ http_headers = { Accept = "application/json" }
 expected_status = 200
 
 [[monitor]]
-name = "DB locale"
+name = "local DB "
 type = "PORT"
 host = "10.0.0.5"
 port = 5432
 interval = 120
 tags = ["db","postgres"]
 
-- Exemple avec chaîne multi‑ligne :
 [[monitor]]
 name = "API token check"
 type = "HTTP"
@@ -106,23 +114,24 @@ http_body = """
   "secret": "xyz"
 }
 """
+```
 
 Validation et contraintes
 - name doit être non vide et idéalement unique (le script compare par name).
-- type et auth_method validés contre les listes d'enum.
-- interval, timeout, port doivent être des entiers.
-- tags doit être un tableau de strings.
-- notification_ids et maintenance_ids doivent être tableaux d'entiers.
-- http_headers et custom_fields doivent être tables/dictionnaires.
-- Pour auth_method spécifiques, champs requis :
-  - HTTP_BASIC → username et password obligatoires.
-  - OAUTH2_CC → oauth2_token_url, oauth2_client_id, oauth2_client_secret obligatoires.
+- types and auth_method are validated with enum lists.
+- interval, timeout, port are to be integers.
+- tags is a string table.
+- notification_ids and maintenance_ids are integer's array.
+- http_headers and custom_fields should be tables/dictionnaries.
+- for auth_method, required fiekds:
+  - HTTP_BASIC → username and password required.
+  - OAUTH2_CC → oauth2_token_url, oauth2_client_id, oauth2_client_secret required.
 
-Formats alternatifs acceptés par le script
-- Top-level "monitors" comme tableau : monitors = [ {name="A", type="HTTP", ...}, {...} ]
-- Fichier contenant une seule table monitor sans wrapper si il a name+type.
+Accepted alternate formats:
+- Top-level "monitors" as tables: monitors = [ {name="A", type="HTTP", ...}, {...} ]
+- file with only name and type without header/wrapper.
 
-Bonnes pratiques
-- Utiliser des noms de monitors uniques et explicites.
-- Stocker secrets (passwords, client_secret) de façon sécurisée; le fichier TOML contient des secrets en clair.
-- Préférer --dry-run du script pour vérifier la conversion avant d'appliquer.
+Best practices
+- Use explicit and unique names.
+- secrets (passwords, client_secret) are stored in clear text.
+- Use --dry-run to check what would be done.

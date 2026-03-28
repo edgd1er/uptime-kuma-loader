@@ -6,7 +6,7 @@ import logging
 import argparse
 import importlib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Counter
 
 # try tomllib (Py3.11+), otherwise tomli
 try:
@@ -302,7 +302,27 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
   config_groups = set([g['group'] for g in config_monitors if 'group' in g.keys()])
   new_groups = process_groups(api=api, existing_groups=existing_groups, config_groups=config_groups, delete=delete)
 
+  # remove duplicate monitors
+  c = Counter([e['name'] for e in existing_config])
+  logger.debug(f'counter: {c}')
+  c = Counter([e for e in existing_monitors])
+  logger.debug(f'counter: {c}')
+
+  existing_monitor_ids = [ existing_monitors[e]['id'] for e in existing_monitors ]
+  for elt in existing_config:
+    mon_id = elt['id']
+    name = elt['name']
+    if mon_id not in existing_monitor_ids:
+      logger.warning(f'Duplicate found: {name}, id: {mon_id}')
+      existing_config.remove(elt)
+      if delete:
+        result = api.delete_monitor(id_=int(mon_id))
+        logger.info(f"Deleting duplicate monitor '{name}', id={mon_id}, result: {result['msg']}")
+        logger.debug(f"Deleting duplicate monitor '{name}', id={mon_id}, result: {result}")
+
+
   # Monitors
+  monitor_processed =[]
   for m in config_monitors:
     if m['type'] == "notification":
       result = create_update_notification(m)
@@ -310,6 +330,7 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
       # then monitors
       logger.debug(f'monitor m: {m}')
       id_tags = []
+      mon_id = None
       name = m["name"]
       monitor_toml_tags = m["tags"]
       # replace notification name with ids
@@ -350,18 +371,19 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
         continue
       try:
         if name in existing_monitors:
-          # update monitor
           mon_id = existing_monitors[name]["id"]
-          logger.info(f"Updating monitor '{name}' (id={mon_id})...")
-          logger.debug(f"Updating monitor '{name}' (id={mon_id})..., payload: {payload}")
+          # update monitor
           result = api.edit_monitor(mon_id, **payload)
+          logger.info(f"Updating monitor '{name}', id={mon_id}, result: {result['msg']}")
+          logger.debug(f"Updating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
           mon_id = result["monitorID"]
           result = api.get_monitor(id_=mon_id)
+          monitor_processed.append(name)
         else:
           # create monitor
-          logger.info(f"Creating monitor '{name}'...")
-          logger.debug(f"Creating monitor '{name}', payload: {payload}")
           result = api.add_monitor(**payload)
+          logger.info(f"Creating monitor '{name}', id={mon_id}, result: {result['msg']}")
+          logger.debug(f"Creating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
           mon_id = result["monitorID"]
 
       except Exception as e:
@@ -369,10 +391,9 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
         logger.debug(f"Error applying monitor '{name}', payload: {payload}, exception: {e}")
 
       logger.info("Import completed.")
-      logger.debug(f'result: {result}, id_tags: {id_tags}')
-
       # handle tags
       process_existing_tags(api=api, monitor_id = mon_id, monitor=m, existing_tags=existing_tags)
+      logger.debug(f'result: {result}, id_tags: {id_tags}')
 
 
 # handle tags
@@ -445,8 +466,8 @@ def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[
   try:
     existing_config = api.get_monitors()
     existing_monitors = {mon["name"]: mon for mon in existing_config if "name" in mon and "id" in mon}
-    logger.debug(f'existing config: {existing_config}')
-    logger.debug(f'existing config: {len(existing_config)}')
+    logger.debug(f'existing config: len: {len(existing_config)}, {existing_config}')
+    logger.debug(f'existing monitors: len: {len(existing_monitors)}, {existing_monitors}')
   except Exception as e:
     logger.error(f"Failed to fetch existing monitors: {e}")
     api.disconnect()
@@ -494,6 +515,7 @@ def load_toml_config_file(file_path: str) -> tuple[Exception, list[dict[str, Any
     monitors, notifications = load_toml(file_path)
   except (ConfigError, Exception) as e:
     logger.error(f"Configuration error: {e}")
+    sys.exit(1)
   return e, monitors, notifications
 
 
