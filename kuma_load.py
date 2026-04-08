@@ -297,7 +297,7 @@ def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [
     temp = config_docker_hosts_ids[add_docker]
     result = api.add_docker_host(**temp)
     logger.debug(f'add_docker: {add_docker}, result: {result}')
-    logger.info(f'add_docker: {add_docker}, result: {result["msg"]}, {api.test_docker_host(result['id'])}')
+    #logger.info(f'add_docker: {add_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**result)}')
     added.append(add_docker)
 
   for edit_docker in to_edit:
@@ -307,7 +307,7 @@ def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [
                "dockerType": existing_docker_hosts_ids[edit_docker]['dockerType'],
                "dockerDaemon": existing_docker_hosts_ids[edit_docker]['dockerDaemon']}
     logger.debug(f'edit_docker: {edit_docker}, result: {result}')
-    logger.info(f'edit_docker: {edit_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**payload)}')
+    #logger.info(f'edit_docker: {edit_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**payload)}')
     edited.append(edit_docker)
 
   if delete and len(to_delete) > 0:
@@ -315,13 +315,13 @@ def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [
       docker_id = existing_docker_hosts_ids[delete_docker]['id']
       result = api.delete_docker_host(id_=docker_id)
       logger.debug(f'delete_docker: {delete_docker}, result: {result}')
-      logger.info(f'delete_docker: {delete_docker}, result: {result["msg"]}, nb: {api.test_docker_host(docker_id)}')
+      logger.info(f'delete_docker: {delete_docker}, result: {result["msg"]}')
       deleted.append(delete_docker)
 
   logger.info(f'added: {len(added)}, edited: {len(edited)}, deleted: {len(deleted)}')
   logger.debug(f'added: {added}, edited: {edited}, deleted: {deleted}')
 
-  return new_existing_docker_hosts
+  return api.get_docker_hosts()
 
 
 def add_remove_tags(api: UptimeKumaApi = None, existing_tags: Dict[str, Any] = None, config_tags: list[str] = None,
@@ -443,7 +443,13 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
 
   # add/edit/remove docker_hosts
   existing_docker_hosts = api.get_docker_hosts()
-  # new_docker_hosts = process_docker_hosts(api=api,config_docker_hosts=config_docker_hosts, existing_docker_hosts=existing_docker_hosts, delete=delete)
+  new_docker_hosts = process_docker_hosts(api=api,config_docker_hosts=config_docker_hosts, existing_docker_hosts=existing_docker_hosts, delete=delete)
+  # replace docker_host by id if string found
+  for c in config_monitors:
+    if "docker_host" in c.keys():
+      name_docker = c['docker_host']
+      if isinstance(name_docker, str):
+          c['docker_host'] = ([ dh['id'] for dh in new_docker_hosts if dh['name'] == name_docker ][0])
 
   # add/edit/delete containers
 
@@ -498,13 +504,16 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
       id_tags = []
       mon_id = None
       name = m["name"]
-      monitor_toml_tags = m["tags"]
+      monitor_toml_tags = m["tags"] if "tags" in m.keys() else []
       # replace notification name with ids
       new_notification_ids_list = []
-      for notif in m["notificationIDList"]:
-        m["notificationIDList"].remove(notif)
-        new_notification_ids_list.append(new_notifications[notif]['id'])
-      m["notificationIDList"] = new_notification_ids_list
+      if "notificationIDList" in m.keys():
+        for notif in m["notificationIDList"]:
+          m["notificationIDList"].remove(notif)
+          new_notification_ids_list.append(new_notifications[notif]['id'])
+        m["notificationIDList"] = new_notification_ids_list
+      else:
+        m["notificationIDList"] = []
       payload = normalize_monitor_for_api(m)
 
       # add group if required
@@ -523,8 +532,13 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
           logger.info(f"[DRY-RUN] Would create monitor '{name}' with payload: {payload}")
         continue
 
-      # replace tag name with its id
-      payload['tags'] = replace_tag_names_with_id(payload['tags'], existing_tags)
+      # save tags for later, remove from payloads as tag are traeted separately
+      if "tags" in payload.keys():
+        payload_tags = payload['tags']
+          #replace_tag_names_with_id(payload['tags'], existing_tags))
+        payload.pop("tags", None)
+      else:
+        payload_tags = []
 
       # update monitor
       if name in existing_monitors:
@@ -553,6 +567,8 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
 
       logger.info(f"Import completed for '{name}'.")
       # handle tags
+      # restore tags from config
+      m['tags'] = payload_tags
       update_monitor_tags(api=api, monitor_id=mon_id, monitor=m, kuma_monitor=kuma_monitor, existing_tags=new_tags_id,
                           delete=delete)
       logger.debug(f'result: {result}, id_tags: {id_tags}')
@@ -562,7 +578,7 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
 def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=None, kuma_monitor=None,
                         existing_tags=None, delete: bool = False) -> None:
   """
-  after monitor update
+  after monitor update, add tag association if missing.
   :param monitor_id:
   :param api:
   :param monitor:
@@ -588,6 +604,11 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
     # full structure for an edited monitor
     if all(isinstance(x, dict) for x in monitor['tags']):
       add_tags = set(add_tags) - set([k['tag_id'] for k in monitor['tags']])
+
+    # if int, already
+    if all(isinstance(x, int) for x in monitor['tags']):
+      add_tags.extend(monitor['tags'])
+
 
   # use a counter for duplicates identification
   duplicates = {k: v for k, v in Counter(add_tags).items() if v > 1}
@@ -626,6 +647,11 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
 
 
 def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[str, dict]]:
+  """
+  return monitors in kuma (existing_config) and rebuild a dictionay with monitor name as key (existing_monitors)
+  :param api:
+  :return:
+  """
   existing = {}
   try:
     existing_config = api.get_monitors()
