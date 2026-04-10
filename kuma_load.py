@@ -173,37 +173,42 @@ def process_notifications(api: UptimeKumaApi = None, existing_notifications: lis
                           config_notifications: list[Dict[str, Any]] = None, delete: bool = False) -> dict[
   Any, dict[str, Any] | Any]:
   new_notifications = {}
-  existing_notifications_names = {e['name']: e for e in existing_notifications}
+  existing_notifications_names = [e['name'] for e in existing_notifications]
+  existing_notifications_dict = {e['name']:e for e in existing_notifications}
   config_notifications_names = {e['name'] for e in config_notifications}
   config_notifications_dict = {e['name']: e for e in config_notifications}
   logger.debug(f'existing_notifications: {existing_notifications}')
   logger.info(
-    f'existing_notifications: {len(existing_notifications)}, names: {[e for e in existing_notifications_names.keys()]}')
+    f'existing_notifications: {len(existing_notifications)}, names: {[e for e in existing_notifications_dict.keys()]}')
 
   logger.debug(f'config_notifications: {config_notifications}')
   logger.info(f'config_notifications: {len(config_notifications)}, names: {[e for e in config_notifications_names]}')
   actions = {'added': [], 'edited': [], 'deleted': []}
 
-  to_delete = set(existing_notifications_names.keys()) - config_notifications_names
-  to_add = config_notifications_names - set(existing_notifications_names.keys())
-  to_edit = config_notifications_names & set(existing_notifications_names.keys())
+  to_delete = set(existing_notifications_dict.keys()) - config_notifications_names
+  to_add = config_notifications_names - set(existing_notifications_dict.keys())
+  to_edit = config_notifications_names & set(existing_notifications_dict.keys())
 
+  c= Counter(existing_notifications_names)
+  duplicates = [ k for k,v in c.items() if v >1 ]
+  for i in duplicates:
+    to_delete.add(i)
   logger.debug(f'notifications: deletion requested: {delete}, to_delete: {to_delete}, to_add: {to_add}')
 
   # add notification
   for n in to_add:
-    payload = config_notifications[n]
+    payload = config_notifications_dict[n]
     result = api.add_notification(**payload)
     # update current list of notifications
-    existing_notifications[n] = {'name': n, 'id': result['monitorID']}
+    existing_notifications[n] = {'name': n, 'id': result['id']}
     logger.info(f"Created new notification '{n}', msg: {result['msg']}'")
-    logger.debug(f"Created new notification '{n}',id :{result['monitorID']} , result: {result}")
+    logger.debug(f"Created new notification '{n}',id :{result['id']} , result: {result}")
     actions['added'].append(n)
 
   # edit notification
   for n in to_edit:
     payload = config_notifications_dict[n]
-    existing_notification = existing_notifications_names[n]
+    existing_notification = existing_notifications_dict[n]
     logger.debug(f"Edited notification '{n}', id: {existing_notification} ,payload: {payload}")
     result = api.edit_notification(id_=existing_notification['id'], **payload)
     logger.info(f"Edited notification '{n}', msg: {result['msg']}'")
@@ -213,12 +218,12 @@ def process_notifications(api: UptimeKumaApi = None, existing_notifications: lis
     # delete notifications
   if delete and len(to_delete) > 0:
     for n in to_delete:
-      id = existing_notifications[n]['id']
-      result = api.delete_notification(id_=n['id'])
+      id = existing_notifications_dict[n]['id']
+      result = api.delete_notification(id_=id)
       logger.info(f"Deleted group '{n}', id: '{id}', msg: {result['msg']}")
       logger.debug(f"Deleted new group '{n}, result: {result}'")
       # remove deleted group
-      existing_notifications.pop(n)
+      existing_notifications_dict.pop(n)
       actions['deleted'].append(n)
 
   logger.debug(
@@ -279,10 +284,10 @@ def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [
     sys.exit(4)
 
   new_existing_docker_hosts = {}
-  existing_docker_hosts_ids = {d['name']: d for d in existing_docker_hosts}
-  existing_names = existing_docker_hosts_ids.keys()
+  existing_docker_host_names = {d['name']: d for d in existing_docker_hosts}
+  existing_docker_hosts_ids = {d['id']: d for d in existing_docker_hosts}
+  existing_names = existing_docker_host_names.keys()
   config_docker_names = [d['name'] for d in config_docker_hosts]
-  config_docker_hosts_ids = {d['name']: d for d in config_docker_hosts}
   to_add = set(config_docker_names) - set(existing_names)
   to_delete = existing_names - config_docker_names
   to_edit = config_docker_names & existing_names
@@ -294,18 +299,18 @@ def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [
   deleted = []
 
   for add_docker in to_add:
-    temp = config_docker_hosts_ids[add_docker]
+    temp = config_docker_names[add_docker]
     result = api.add_docker_host(**temp)
     logger.debug(f'add_docker: {add_docker}, result: {result}')
     #logger.info(f'add_docker: {add_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**result)}')
     added.append(add_docker)
 
   for edit_docker in to_edit:
-    docker_id = existing_docker_hosts_ids[edit_docker]['id']
-    result = api.edit_docker_host(id_=docker_id, **existing_docker_hosts_ids[edit_docker])
-    payload = {"name": existing_docker_hosts_ids[edit_docker]['name'],
-               "dockerType": existing_docker_hosts_ids[edit_docker]['dockerType'],
-               "dockerDaemon": existing_docker_hosts_ids[edit_docker]['dockerDaemon']}
+    docker_id = existing_docker_host_names[edit_docker]['id']
+    result = api.edit_docker_host(id_=docker_id, **existing_docker_hosts_ids[docker_id])
+    payload = {"name": existing_docker_host_names[edit_docker]['name'],
+               "dockerType": existing_docker_host_names[edit_docker]['dockerType'],
+               "dockerDaemon": existing_docker_host_names[edit_docker]['dockerDaemon']}
     logger.debug(f'edit_docker: {edit_docker}, result: {result}')
     #logger.info(f'edit_docker: {edit_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**payload)}')
     edited.append(edit_docker)
@@ -714,7 +719,7 @@ def main():
 
   p = argparse.ArgumentParser(description="Import monitors from TOML into UptimeKuma via UptimeKumaApi")
   p.add_argument("--file", "-f", help="TOML file path", default="kuma.toml")
-  p.add_argument("--api_url", "-a", help="UptimeKuma API URL or connection string", default="http://localhost:3001")
+  p.add_argument("--api-url", "-a", help="UptimeKuma API URL or connection string", default="http://localhost:3001")
   p.add_argument("--username", "-u", help="API username", required=True)
   p.add_argument("--password", "-p", help="API password", required=True)
   p.add_argument("--token", "-t", help="API token (alternative to username/password)")
