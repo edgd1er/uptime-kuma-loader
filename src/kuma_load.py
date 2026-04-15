@@ -6,7 +6,7 @@ import logging
 import argparse
 import importlib
 from pathlib import Path
-from typing import List, Dict, Any, Counter, LiteralString
+from typing import List, Dict, Any, Counter, LiteralString, Tuple, Optional
 from unittest import result
 
 # try tomllib (Py3.11+), otherwise tomli
@@ -45,22 +45,45 @@ VALID_AUTH_METHODS = {"none", "http_basic", "ntlm", "mtls", "oauth2_cc"}
 
 
 # functions
-def get_token_from_kuma_api(kuma_api: UptimeKumaApi = None, username: str = '', password: str = '',
-                            token: str = '') -> str:
-  token = ''
+def get_token_from_kuma_api(kuma_api: "UptimeKumaApi",
+                            username: str = "",
+                            password: str = "",
+                            token: str = "") -> Optional[str]:
+  """
+  Retourne un token valide en utilisant, dans l'ordre :
+  - le token donné (si non vide) via login_by_token
+  - sinon username/password via login
+  Retourne None en cas d'échec.
+  """
+  if kuma_api is None:
+    logger.error("kuma_api is None")
+    return None
+
   try:
     if token:
       result = kuma_api.login_by_token(token)
     elif username and password:
       result = kuma_api.login(username, password)
-    token = result.get("token")
-    logger.debug(f'token: {token}, result: {result}')
-  except Exception as e:
-    logger.error(f"Authentication error: {e}")
-    kuma_api.disconnect()
-    sys.exit(4)
+    else:
+      logger.error("No credentials provided (token or username+password)")
+      return None
 
-  return token
+    tok = result.get("token")
+    if not tok:
+      logger.error("Authentication succeeded but no token returned")
+      return None
+
+    logger.debug("Authentication result: %s", result)
+    return tok
+
+  except Exception as e:
+    logger.exception("Authentication error")
+    # ne pas faire sys.exit ici : laisser l'appelant gérer l'arrêt
+    try:
+      kuma_api.disconnect()
+    except Exception:
+      logger.debug("kuma_api.disconnect() failed", exc_info=True)
+    return None
 
 
 def validate_monitor(m: Dict[str, Any]) -> None:
@@ -106,41 +129,52 @@ def validate_monitor(m: Dict[str, Any]) -> None:
         raise ConfigError(f"Monitor '{m['name']}': auth_method OAUTH2_CC requires '{key}'.")
 
 
-def load_toml(path: str) -> tuple[list | list[Any], list[Any] | Any, list[Any] | Any]:
-  with open(path, "rb") as f:
-    data = tomllib.load(f)
-  monitors = []
-  notifications = []
-  maintenances = []
-  # support [[monitor]] tables
-  if "monitor" in data and isinstance(data["monitor"], list):
-    monitors = data["monitor"]
-  elif "monitors" in data and isinstance(data["monitors"], list):
-    monitors = data["monitors"]
-  else:
-    # support top-level array or single monitor table
-    if isinstance(data, list):
-      monitors = data
-    else:
-      if all(k in data for k in ("name", "type")):
-        monitors = [data]
-      else:
-        raise ConfigError(
-          "TOML must contain [[monitor]] tables, a top-level 'monitor(s)' array, or a single monitor table with 'name' and 'type'.")
+def load_toml(path: str) -> Tuple[
+  Optional[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+  try:
+    with open(path, "rb") as f:
+      data = tomllib.load(f)
+  except FileNotFoundError:
+    raise ConfigError(f"TOML file not found: {path}")
+  except tomllib.TOMLDecodeError as e:
+    raise ConfigError(f"Invalid TOML: {e}") from e
 
-  if "notification" in data and isinstance(data["notification"], list):
+  docker: Optional[Dict[str, Any]] = None
+  monitors: List[Dict[str, Any]] = []
+  notifications: List[Dict[str, Any]] = []
+  maintenances: List[Dict[str, Any]] = []
+
+  # monitors: prefer explicit tables/arrays, else single top-level table or array
+  if isinstance(data, list):
+    monitors = data
+  else:
+    if isinstance(data.get("monitor"), list):
+      monitors = data["monitor"]
+    elif isinstance(data.get("monitors"), list):
+      monitors = data["monitors"]
+    elif all(k in data for k in ("name", "type")) and isinstance(data, dict):
+      monitors = [data]
+
+  if not monitors:
+    raise ConfigError("No monitors found in TOML file.")
+
+  # notifications
+  if isinstance(data.get("notification"), list):
     notifications = data["notification"]
 
-  if "docker" in data and isinstance(data["notification"], list):
+  # docker
+  if isinstance(data.get("docker"), list):
     docker = data["docker"]
 
-  if "maintenance" in data and isinstance(data["maintenance"], list):
+  # maintenances
+  if isinstance(data.get("maintenance"), list):
     maintenances = data["maintenance"]
 
-  if not isinstance(monitors, list) or not monitors:
-    raise ConfigError("No monitors found in TOML file.")
   for m in monitors:
+    if not isinstance(m, dict):
+      raise ConfigError("Each monitor must be a table/object")
     validate_monitor(m)
+
   return docker, monitors, notifications, maintenances
 
 
@@ -281,54 +315,76 @@ def process_groups(api: UptimeKumaApi = None, existing_groups=None, config_group
   return existing_groups
 
 
-def process_docker_hosts(api: UptimeKumaApi = None, config_docker_hosts: Any = [], existing_docker_hosts: Any = [],
-                         delete: bool = False) -> Any:
+def process_docker_hosts(
+        api: "UptimeKumaApi",
+        config_docker_hosts: Optional[List[Dict[str, Any]]] = None,
+        existing_docker_hosts: Optional[List[Dict[str, Any]]] = None,
+        delete: bool = False,
+) -> List[Dict[str, Any]]:
   if api is None:
-    logger.error(f'api is none')
-    sys.exit(4)
+    raise ValueError("api must not be None")
 
-  new_existing_docker_hosts = {}
-  existing_docker_host_names = {d['name']: d for d in existing_docker_hosts}
-  existing_docker_hosts_ids = {d['id']: d for d in existing_docker_hosts}
-  existing_names = existing_docker_host_names.keys()
-  config_docker_names = [d['name'] for d in config_docker_hosts]
-  to_add = set(config_docker_names) - set(existing_names)
-  to_delete = existing_names - config_docker_names
-  to_edit = config_docker_names & existing_names
-  logger.debug(
-    f'to_add: {len(to_add)}, {to_add}, to_delete: {len(to_delete)}, {to_delete}, to_edit: {len(to_edit)}, {to_edit}')
-  logger.info(f'to_add: {len(to_add)}, to_delete: {len(to_delete)}, to_edit: {len(to_edit)}')
-  added = []
-  edited = []
-  deleted = []
+  config = config_docker_hosts or []
+  existing = existing_docker_hosts or []
 
-  for add_docker in to_add:
-    temp = config_docker_names[add_docker]
-    result = api.add_docker_host(**temp)
-    logger.debug(f'add_docker: {add_docker}, result: {result}')
-    # logger.info(f'add_docker: {add_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**result)}')
-    added.append(add_docker)
+  # Validate inputs
+  if not isinstance(config, list) or not isinstance(existing, list):
+    raise TypeError("config_docker_hosts and existing_docker_hosts must be lists")
 
-  for edit_docker in to_edit:
-    docker_id = existing_docker_host_names[edit_docker]['id']
-    result = api.edit_docker_host(id_=docker_id, **existing_docker_hosts_ids[docker_id])
-    payload = {"name": existing_docker_host_names[edit_docker]['name'],
-               "dockerType": existing_docker_host_names[edit_docker]['dockerType'],
-               "dockerDaemon": existing_docker_host_names[edit_docker]['dockerDaemon']}
-    logger.debug(f'edit_docker: {edit_docker}, result: {result}')
-    # logger.info(f'edit_docker: {edit_docker}, result: {result["msg"]}, nb: {api.test_docker_host(**payload)}')
-    edited.append(edit_docker)
+  # Index by name and by id for convenience
+  existing_by_name = {d['name']: d for d in existing}
+  existing_by_id = {d['id']: d for d in existing}
+  config_by_name = {d['name']: d for d in config}
 
-  if delete and len(to_delete) > 0:
-    for delete_docker in to_delete:
-      docker_id = existing_docker_hosts_ids[delete_docker]['id']
-      result = api.delete_docker_host(id_=docker_id)
-      logger.debug(f'delete_docker: {delete_docker}, result: {result}')
-      logger.info(f'delete_docker: {delete_docker}, result: {result["msg"]}')
-      deleted.append(delete_docker)
+  config_names = set(config_by_name.keys())
+  existing_names = set(existing_by_name.keys())
 
-  logger.info(f'added: {len(added)}, edited: {len(edited)}, deleted: {len(deleted)}')
-  logger.debug(f'added: {added}, edited: {edited}, deleted: {deleted}')
+  to_add = config_names - existing_names
+  to_delete = existing_names - config_names
+  to_edit = config_names & existing_names
+
+  added, edited, deleted = [], [], []
+
+  # Add new docker hosts
+  for name in to_add:
+    payload = config_by_name[name]
+    try:
+      result = api.add_docker_host(**payload)
+      added.append(name)
+      logger.info("Added docker host %s", name)
+      logger.debug("add result: %s", result)
+    except Exception:
+      logger.exception("Failed to add docker host %s", name)
+
+  # Edit existing docker hosts
+  for name in to_edit:
+    existing_entry = existing_by_name[name]
+    docker_id = existing_entry['id']
+    # we should send desired config (from config), not existing entry
+    payload = config_by_name[name]
+    try:
+      result = api.edit_docker_host(id_=docker_id, **payload)
+      edited.append(name)
+      logger.info("Edited docker host %s (id=%s)", name, docker_id)
+      logger.debug("edit result: %s", result)
+    except Exception:
+      logger.exception("Failed to edit docker host %s (id=%s)", name, docker_id)
+
+  # Delete removed docker hosts (only if delete requested)
+  if delete:
+    for name in to_delete:
+      entry = existing_by_name[name]
+      docker_id = entry['id']
+      try:
+        result = api.delete_docker_host(id_=docker_id)
+        deleted.append(name)
+        logger.info("Deleted docker host %s (id=%s)", name, docker_id)
+        logger.debug("delete result: %s", result)
+      except Exception:
+        logger.exception("Failed to delete docker host %s (id=%s)", name, docker_id)
+
+  logger.info("added=%d edited=%d deleted=%d", len(added), len(edited), len(deleted))
+  logger.debug("added=%s edited=%s deleted=%s", added, edited, deleted)
 
   return api.get_docker_hosts()
 
@@ -425,10 +481,10 @@ def convert_time_range(thismaintenance):
   if not 'timeRange' in thismaintenance.keys():
     return thismaintenance
 
-  new_time_range =[]
+  new_time_range = []
   for elt in thismaintenance["timeRange"]:
     splitted = elt.split(':')
-    new_time_range.append({ "hours": int(splitted[0]), "minutes": int(splitted[1]), "seconds": int(splitted[2])})
+    new_time_range.append({"hours": int(splitted[0]), "minutes": int(splitted[1]), "seconds": int(splitted[2])})
   thismaintenance['timeRange'] = new_time_range
 
   return thismaintenance
@@ -483,19 +539,19 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
   # add existing maintenance
   for elt in to_add:
     thismaintenance = [m for m in config_maintenance if m['title'] == elt][0]
-    thismaintenance= convert_time_range(thismaintenance)
-    #extract monitor list id
+    thismaintenance = convert_time_range(thismaintenance)
+    # extract monitor list id
     if 'monitorslist' in thismaintenance:
-      monitors_list = thismaintenance.pop('monitorslist',None)
+      monitors_list = thismaintenance.pop('monitorslist', None)
       if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [ l['id'] for l in monitors ]
+        monitors_id_list = [l['id'] for l in monitors]
       else:
-        monitors_id_list = [ l['id'] for i in monitors_list for l in monitors if l['name'] == i['name'] ]
+        monitors_id_list = [l['id'] for i in monitors_list for l in monitors if l['name'] == i['name']]
     else:
       monitors_id_list = []
     # add maintenance
     result = api.add_maintenance(**thismaintenance)
-    id=result['maintenanceID']
+    id = result['maintenanceID']
     logger.info(f"Adding maintenance '{elt}', id={id}, result: {result['msg']}")
     logger.debug(f"Adding maintenance '{elt}', id={id}, result: {result}")
     existing_maintenance_dict[elt] = result
@@ -515,11 +571,11 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     thismaintenance = convert_time_range(thismaintenance)
     # extract monitor list id
     if 'monitorslist' in thismaintenance:
-      monitors_list = thismaintenance.pop('monitorslist',None)
+      monitors_list = thismaintenance.pop('monitorslist', None)
       if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [ l['id'] for l in monitors ]
+        monitors_id_list = [l['id'] for l in monitors]
       else:
-        monitors_id_list = [ l['id'] for i in monitors_list for l in monitors if l['name'] == i['name'] ]
+        monitors_id_list = [l['id'] for i in monitors_list for l in monitors if l['name'] == i['name']]
     else:
       monitors_id_list = []
     # edit maintenance
@@ -530,10 +586,10 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     edited.append(elt)
     # update monitors association
     # TODO delete if existing ?
-    #current_monitors= api.get_monitor_maintenance(id_=id)
-    #current_monitors_id = [ c['id'] for c in current_monitors ]
-    #to_delete = monitors_id_list - current_monitors_id
-    #result = api.
+    # current_monitors= api.get_monitor_maintenance(id_=id)
+    # current_monitors_id = [ c['id'] for c in current_monitors ]
+    # to_delete = monitors_id_list - current_monitors_id
+    # result = api.
     monitors_id = []
     for l in monitors_id_list:
       monitors_id.append({'id': l})
@@ -575,16 +631,23 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
   config_groups = set([g['group'] for g in config_monitors if 'group' in g.keys()])
   new_groups = process_groups(api=api, existing_groups=existing_groups, config_groups=config_groups, delete=delete)
 
-  # add/edit/remove docker_hosts
+
+  # récupérer et synchroniser les docker hosts
   existing_docker_hosts = api.get_docker_hosts()
-  new_docker_hosts = process_docker_hosts(api=api, config_docker_hosts=config_docker_hosts,
-                                          existing_docker_hosts=existing_docker_hosts, delete=delete)
-  # replace docker_host by id if string found
+  new_docker_hosts = process_docker_hosts( api=api, config_docker_hosts=config_docker_hosts,
+    existing_docker_hosts=existing_docker_hosts, delete=delete )
+
+  # construire index name -> id pour lookup O(1)
+  name_to_id = {dh['name']: dh['id'] for dh in new_docker_hosts}
+
+  # remplacer docker_host (si string) par son id, en validant l'existence
   for c in config_monitors:
-    if "docker_host" in c.keys():
-      name_docker = c['docker_host']
-      if isinstance(name_docker, str):
-        c['docker_host'] = ([dh['id'] for dh in new_docker_hosts if dh['name'] == name_docker][0])
+    name = c.get("docker_host")
+    if isinstance(name, str):
+      docker_id = name_to_id.get(name)
+      if docker_id is None:
+        raise ConfigError(f"Docker host named '{name}' not found")
+      c['docker_host'] = docker_id
 
   # add/edit/delete containers
   # TODO
