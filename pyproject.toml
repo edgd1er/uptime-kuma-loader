@@ -1,10 +1,10 @@
 [project]
-name = "uptime kuma loader"
+name = "kuma_load"
 version = "0.0.1"
 authors = [
     { name="Edgd1er", email="edgd1er@hotmail.com" },
 ]
-description = "Read configuration from file, import it through uptime-kuma-s api. delete non configured items if required."
+description = "uptime kuma loader: Read configuration from file, import it through uptime-kuma-s api. delete non configured items if required."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
@@ -19,33 +19,34 @@ license = {text = "GNU General Public License v3.0" }
 
 dependencies = [
     "uptime-kuma-api",
-    "tomli",
-    "influxdb-client",
-    "mysql-connector-python",
-    "http-plot-server"
+    "tomli"
 ]
 
 [project.optional-dependencies]
-dev = ["black", "isort"]
+dev = ["black", "isort","tomli_w","pytest","pytest-cov"]
+
+[project.scripts]
+ssay = "kuma_load.__main__:main"
 
 [build-system]
 requires = ["setuptools >= 77.0.3"]
 build-backend = "setuptools.build_meta"
-description=""
+
+[tool.setuptools.packages.find]
+where = ["."]
 
 [project.urls]
 Homepage = "https://github.com/edgd1er/uptime-kuma-loader"
 Issues = "https://github.com/edgd1er/uptime-kuma-loader/issues"
 
-
-[tool.setuptools.packages.find]
-where = ["."]
-
-#[project.scripts]
-#linky = "linky.__main__:main"
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
 
 [tool.black]
 line-length = 88
 
 [tool.isort]
 profile = "black"
+

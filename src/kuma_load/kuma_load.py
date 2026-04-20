@@ -7,7 +7,7 @@ import argparse
 import importlib
 from pathlib import Path
 from typing import List, Dict, Any, Counter, LiteralString, Tuple, Optional
-from unittest import result
+
 
 # try tomllib (Py3.11+), otherwise tomli
 try:
@@ -85,8 +85,11 @@ def get_token_from_kuma_api(kuma_api: "UptimeKumaApi",
       logger.debug("kuma_api.disconnect() failed", exc_info=True)
     return None
 
-
 def validate_monitor(m: Dict[str, Any]) -> None:
+  """
+  Check monitor against an expected structure
+  :param m:
+  """
   if not isinstance(m, dict):
     raise ConfigError("Monitor entry must be a table/object.")
   missing = REQUIRED_MONITOR_FIELDS - set(m.keys())
@@ -100,7 +103,7 @@ def validate_monitor(m: Dict[str, Any]) -> None:
     raise ConfigError(
       f"Monitor '{m['name']}': unknown type '{m['type']}'. Valid: {', '.join(sorted(VALID_MONITOR_TYPES))}")
   if "auth_method" in m:
-    if not isinstance(m["auth_method"], str) or m["auth_method"] not in VALID_AUTH_METHODS:
+    if not isinstance(m["auth_method"], str) or m["auth_method"].lower() not in VALID_AUTH_METHODS:
       raise ConfigError(
         f"Monitor '{m['name']}': invalid auth_method '{m.get('auth_method')}'. Valid: {', '.join(sorted(VALID_AUTH_METHODS))}")
   if "interval" in m and not isinstance(m["interval"], int):
@@ -206,7 +209,8 @@ def create_update_notification(api: UptimeKumaApi = None, config=None, dry_run: 
 
   logger.debug(f'result: {result}')
 
-
+#-----------------------------------------------------------
+# TODO Test
 def process_notifications(api: UptimeKumaApi = None, existing_notifications: list[Dict[str, Any]] = None,
                           config_notifications: list[Dict[str, Any]] = None, delete: bool = False) -> dict[
   Any, dict[str, Any] | Any]:
@@ -844,6 +848,8 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
       except Exception as e:
         logger.error(f'error adding tag {tag} to monitor {monitor_id}: {e}')
 
+#----------------------------------------------------------
+# TODO: tested
 
 def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[str, dict]]:
   """
