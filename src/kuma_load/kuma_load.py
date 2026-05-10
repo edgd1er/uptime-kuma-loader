@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 # client = docker.from_env()
 LDIR = os.path.dirname(os.path.realpath(__file__))
+CDIR = os.getcwd()
 
 REQUIRED_MONITOR_FIELDS = {"name", "type"}
 VALID_MONITOR_TYPES = {
@@ -195,23 +196,9 @@ def normalize_monitor_for_api(m: Dict[str, Any]) -> Dict[str, Any]:
   return out
 
 
-def create_update_notification(api: UptimeKumaApi = None, config=None, dry_run: bool = False):
-  if config is None:
-    return {}
-  kuma_notifications = api.get_notifications()
-  payload = {'active': True, 'applyExisting': True, 'id': 1, 'isDefault': True, 'name': 'notification 1',
-             'pushAPIKey': '123456789', 'type': 'PushByTechulus',
-             'userId': 1}
-  if config['name'] == kuma_notifications['name']:
-    result = api.edit_notification(id_=config['name'], payload=payload)
-  else:
-    result = api.add_notification(payload=payload)
-
-  logger.debug(f'result: {result}')
-
 #-----------------------------------------------------------
 # TODO Test
-def process_notifications(api: UptimeKumaApi = None, existing_notifications: list[Dict[str, Any]] = None,
+def process_notifications(api: "UptimeKumaApi" = None, existing_notifications: list[Dict[str, Any]] = None,
                           config_notifications: list[Dict[str, Any]] = None, delete: bool = False) -> dict[
   Any, dict[str, Any] | Any]:
   new_notifications = {}
@@ -607,8 +594,34 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
   return existing_maintenance_dict
 
 
-def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: bool = False,
+def processed_monitors_paused(api:'UptimeKumaApi', monitors_paused:list[str], dry_run:bool=True):
+
+  if len(monitors_paused) == 0:
+    return
+  try:
+    kuma_monitors = api.get_monitors()
+  except Exception as e:
+    logger.exception(f'Cannot get monitors: {e}')
+
+  monitor_paused_id = [ (k.get('id'),k.get('name')) for k in kuma_monitors if k.get('name') in monitors_paused  ]
+  for id,name in monitor_paused_id:
+    try:
+      result = api.pause_monitor(id)
+      logger.info(f'Monitor {name} ({id}): {result['msg']}')
+    except Exception as e:
+      logger.error(f'pause_monitor {id}, {name}: {e}')
+
+
+
+def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run: bool = False,
                             delete: bool = False) -> None:
+  """
+  import toml config into uptimekuma
+  :param file_path: toml config file path
+  :param api: UptimeKumaApi
+  :param dry_run: if true do not import
+  :param delete: if true, delete monitors not present in toml files
+  """
   e, config_docker_hosts, config_monitors, config_notifications, config_maintenance = load_toml_config_file(file_path)
   if e is not None:
     logger.error(f"Failed to load monitors: {e}")
@@ -634,7 +647,6 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
   # add/remove Groups
   config_groups = set([g['group'] for g in config_monitors if 'group' in g.keys()])
   new_groups = process_groups(api=api, existing_groups=existing_groups, config_groups=config_groups, delete=delete)
-
 
   # récupérer et synchroniser les docker hosts
   existing_docker_hosts = api.get_docker_hosts()
@@ -690,75 +702,89 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
 
   # Monitors
   monitor_processed = []
+  monitors_paused =[]
   for m in config_monitors:
-    if m['type'] == "notification":
-      result = create_update_notification(m)
+
+    # then monitors
+    logger.debug(f'monitor m: {m}')
+    id_tags = []
+    mon_id = None
+    name = m["name"]
+    monitor_toml_tags = m["tags"] if "tags" in m.keys() else []
+    # replace notification name with ids
+    new_notification_ids_list = []
+    if "notificationIDList" in m.keys():
+      for notif in m["notificationIDList"]:
+        m["notificationIDList"].remove(notif)
+        new_notification_ids_list.append(new_notifications[notif]['id'])
+      m["notificationIDList"] = new_notification_ids_list
     else:
-      # then monitors
-      logger.debug(f'monitor m: {m}')
-      id_tags = []
-      mon_id = None
-      name = m["name"]
-      monitor_toml_tags = m["tags"] if "tags" in m.keys() else []
-      # replace notification name with ids
-      new_notification_ids_list = []
-      if "notificationIDList" in m.keys():
-        for notif in m["notificationIDList"]:
-          m["notificationIDList"].remove(notif)
-          new_notification_ids_list.append(new_notifications[notif]['id'])
-        m["notificationIDList"] = new_notification_ids_list
-      else:
-        m["notificationIDList"] = []
-      payload = normalize_monitor_for_api(m)
+      m["notificationIDList"] = []
+    payload = normalize_monitor_for_api(m)
 
-      # add group if required
-      if 'group' in m.keys():
-        # add the new group id to current monitor, parent is the attribute name
-        payload['parent'] = new_groups[m['group']]['id']
-        logger.debug(f"adding parent '{m['group']}' to {name}")
-      # group is not a monitor attribute
-      payload.pop("group", None)
+    # add group if required
+    if 'group' in m.keys():
+      # add the new group id to current monitor, parent is the attribute name
+      payload['parent'] = new_groups[m['group']]['id']
+      logger.debug(f"adding parent '{m['group']}' to {name}")
+    # group is not a monitor attribute
+    payload.pop("group", None)
 
-      if dry_run:
-        if name in existing_monitors:
-          logger.info(
-            f"[DRY-RUN] Would update monitor '{name}' (id={existing_monitors[name]['id']}) with payload: {payload}")
-        else:
-          logger.info(f"[DRY-RUN] Would create monitor '{name}' with payload: {payload}")
-        continue
+    # save paused monitor for later use
+    if 'active' in payload.keys():
+      if payload['active'] == False:
+        logger.debug(f'Adding {name} to paused monitors ({monitors_paused})')
+        monitors_paused.append(payload['name'])
+      payload.pop('active', None)
 
-      # save tags for later, remove from payloads as tag are traeted separately
-      if "tags" in payload.keys():
-        payload_tags = payload['tags']
-        # replace_tag_names_with_id(payload['tags'], existing_tags))
-        payload.pop("tags", None)
-      else:
-        payload_tags = []
 
-      # update monitor
+    if dry_run:
       if name in existing_monitors:
-        mon_id = existing_monitors[name]["id"]
-        try:
-          result = api.edit_monitor(mon_id, **payload)
-          logger.info(f"Updating monitor '{name}', id={mon_id}, result: {result['msg']}")
-          logger.debug(f"Updating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
-          mon_id = result["monitorID"]
-          monitor_processed.append(name)
-          kuma_monitor = api.get_monitor(id_=mon_id)
-        except Exception as e:
-          logger.error(f"Error updating monitor '{name}': {e}")
-          logger.debug(f"Error updating monitor '{name}', payload: {payload}, exception: {e}")
+        logger.info(
+          f"[DRY-RUN] Would update monitor '{name}' (id={existing_monitors[name]['id']}) with payload: {payload}")
       else:
-        # create monitor
-        try:
-          result = api.add_monitor(**payload)
-          logger.info(f"Creating monitor '{name}', id={mon_id}, result: {result['msg']}")
-          logger.debug(f"Creating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
-          mon_id = result["monitorID"]
-          kuma_monitor = api.get_monitor(id_=mon_id)
-        except Exception as e:
-          logger.error(f"Error creating monitor '{name}': {e}")
-          logger.debug(f"Error creating monitor '{name}', payload: {payload}, exception: {e}")
+        logger.info(f"[DRY-RUN] Would create monitor '{name}' with payload: {payload}")
+      continue
+
+    # save tags for later, remove from payloads as tag are traeted separately
+    if "tags" in payload.keys():
+      payload_tags = payload['tags']
+      # replace_tag_names_with_id(payload['tags'], existing_tags))
+      payload.pop("tags", None)
+    else:
+      payload_tags = []
+
+    # update monitor
+    if name in existing_monitors:
+      mon_id = existing_monitors[name]["id"]
+      try:
+        result = api.edit_monitor(mon_id, **payload)
+        logger.info(f"Updating monitor '{name}', id={mon_id}, result: {result['msg']}")
+        logger.debug(f"Updating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
+        mon_id = result["monitorID"]
+        monitor_processed.append(name)
+        kuma_monitor = api.get_monitor(id_=mon_id)
+      except Exception as e:
+        logger.error(f"Error updating monitor '{name}': {e}")
+        logger.debug(f"Error updating monitor '{name}', payload: {payload}, exception: {e}")
+    else:
+      # create monitor
+      try:
+        result = api.add_monitor(**payload)
+        logger.info(f"Creating monitor '{name}', id={mon_id}, result: {result['msg']}")
+        logger.debug(f"Creating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
+        mon_id = result["monitorID"]
+        kuma_monitor = api.get_monitor(id_=mon_id)
+      except Exception as e:
+        logger.error(f"Error creating monitor '{name}': {e}")
+        logger.debug(f"Error creating monitor '{name}', payload: {payload}, exception: {e}")
+
+    if kuma_monitor.get('name') not in monitors_paused:
+      try:
+        result= api.resume_monitor(mon_id)
+        logger.debug(f'resume monitor {name}: {result}')
+      except Exception as e:
+        logger.exception(f'resume monior: {payload["name"]}, error: {e}')
 
     logger.info(f"Import completed for '{name}'.")
 
@@ -771,7 +797,17 @@ def import_config_into_kuma(file_path: str, api: UptimeKumaApi = None, dry_run: 
                         delete=delete)
   logger.debug(f'result: {result}, id_tags: {id_tags}')
 
-  # add/edit/delete maintenance: has to after all monitors add/edit/delete
+  # handle paused monitor
+  result = processed_monitors_paused(api=api, monitors_paused=monitors_paused, dry_run=dry_run)
+
+  # resume all paused groups
+  for g in new_groups:
+    try:
+      result= api.resume_monitor(new_groups[g].get('id'))
+    except Exception as e:
+      logger.exception(f'Cannot resume group {new_groups[g].get('name')}: ${result}')
+
+# add/edit/delete maintenance: has to after all monitors add/edit/delete
   existing_maintenance = api.get_maintenances()
   new_maintenance = process_maintenance(api=api, existing_maintenance=existing_maintenance,
                                         config_maintenance=config_maintenance,
@@ -951,8 +987,11 @@ def main():
     token = args.token
   else:
     token = get_token_from_kuma_api(kuma_api=api, username=args.username, password=args.password)
-
   logger.debug(f'token: {token}')
+
+  if token is None:
+    logger.error(f'Error while operating with a token on api')
+    sys.exit(1)
 
   result = api.get_database_size()
   logger.info(f'Database size: {result["size"]}')
@@ -963,7 +1002,7 @@ def main():
   # result = api.uptime()
   # logger.info(f'uptime: {result}')
 
-  import_config_into_kuma(api=api, file_path=LDIR + os.sep + args.file, dry_run=args.dry_run, delete=args.delete)
+  import_config_into_kuma(api=api, file_path=CDIR + os.sep + args.file, dry_run=args.dry_run, delete=args.delete)
 
   result = api.disconnect()
   logger.debug(f'result: {result}')
