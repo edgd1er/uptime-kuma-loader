@@ -469,7 +469,7 @@ def replace_tag_names_with_id(config_tags: list[str], existing_tags: Dict[str, A
 
 
 def convert_time_range(thismaintenance):
-  if not 'timeRange' in thismaintenance.keys():
+  if 'timeRange' not in thismaintenance.keys():
     return thismaintenance
 
   new_time_range = []
@@ -520,12 +520,12 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
   # if required, maintenance is deleted
   if delete and len(to_delete) > 0:
     for elt in to_delete:
-      id = [v['id'] for k, v in existing_maintenance_names.items() if k == elt][0]
-      result = api.delete_monitor(id_=id)
+      id = [v['id'] for k, v in existing_maintenance_dict.items() if k == elt][0]
+      result = api.delete_maintenance(id_=id)
       logger.info(f"Deleting removed maintenance '{elt}', id={id}, result: {result['msg']}")
       logger.debug(f"Deleting removed maintenance '{elt}', id={id}, result: {result}")
       deleted.append(elt)
-      existing_maintenance_dict[elt].pop()
+      existing_maintenance_dict.pop(elt)
 
   # add existing maintenance
   for elt in to_add:
@@ -537,7 +537,7 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
       if str(monitors_list[0]).lower() == 'all':
         monitors_id_list = [l['id'] for l in monitors]
       else:
-        monitors_id_list = [l['id'] for i in monitors_list for l in monitors if l['name'] == i['name']]
+        monitors_id_list = [l['id']  for l in monitors if l['name'] in monitors_list ]
     else:
       monitors_id_list = []
     # add maintenance
@@ -566,7 +566,7 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
       if str(monitors_list[0]).lower() == 'all':
         monitors_id_list = [l['id'] for l in monitors]
       else:
-        monitors_id_list = [l['id'] for i in monitors_list for l in monitors if l['name'] == i['name']]
+        monitors_id_list = [l['id']  for l in monitors if l['name'] in monitors_list ]
     else:
       monitors_id_list = []
     # edit maintenance
@@ -779,12 +779,12 @@ def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run
         logger.error(f"Error creating monitor '{name}': {e}")
         logger.debug(f"Error creating monitor '{name}', payload: {payload}, exception: {e}")
 
-    if kuma_monitor.get('name') not in monitors_paused:
+    if kuma_monitor is not None and kuma_monitor.get('name') not in monitors_paused:
       try:
         result= api.resume_monitor(mon_id)
         logger.debug(f'resume monitor {name}: {result}')
       except Exception as e:
-        logger.exception(f'resume monior: {payload["name"]}, error: {e}')
+        logger.exception(f'resume monitor: {payload["name"]}, error: {e}')
 
     logger.info(f"Import completed for '{name}'.")
 
@@ -870,9 +870,12 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
 
     for d in delete_tags:
       if d not in add_tags:
-        result = api.delete_monitor_tag(tag_id=d, monitor_id=monitor_id)
-        logger.info(f"Deleting tag '{d}' to monitor {monitor_id}, result: {result['msg']}")
-        logger.debug(f"Deleting tag '{d}' to monitor {monitor_id}, result: {result}")
+        try:
+          result = api.delete_monitor_tag(tag_id=d, monitor_id=monitor_id)
+          logger.info(f"Deleting tag '{d}' to monitor {monitor_id}, result: {result['msg']}")
+          logger.debug(f"Deleting tag '{d}' to monitor {monitor_id}, result: {result}")
+        except Exception as e:
+          logger.exception(f'Error deleting tag {d} to monitor {monitor_id}, result: {e}')
 
   #
   for tag in add_tags:

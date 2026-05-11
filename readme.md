@@ -11,13 +11,13 @@ Implemented:
 * tags
 * groups
 * notification
+* pause/resume
+* maintenance
 
 Not implemented (planned):
 * status page
-* pause/resume
 * uptime
 * statistics
-* maintenance
 
 Not implemented (not planned):
 * proxy
@@ -33,6 +33,10 @@ Main points:
 - groups are also a monitor which type is group.
 - Comments supported with #.
 - Native types TOML : string, integer, boolean, array, table, multiline string ("""...""").
+
+Some key/value pairs were added as not preset in the "add_monitor" function:
+* group
+* active (true = pause). All groups are unpaused.
 
 Monitor's minimal fields:
   * name (string) — monitor's unique name
@@ -135,3 +139,17 @@ Best practices
 - Use explicit and unique names.
 - secrets (passwords, client_secret) are stored in clear text.
 - Use --dry-run to check what would be done.
+
+
+curl --cert ../certificates/intermediateCA/certs/traefik_client.cert.pem --key ../certificates/intermediateCA/private/traefik_client.key.pem https://holdom4.mission.lan:2376/containers/json?all=true
+
+curl --cert ../certificates/intermediateCA/certs/traefik_omv.cert.pem --key ../certificates/intermediateCA/private/traefik_omv.key.pem https://holdom4.mission.lan:2376/containers/json?all=true
+
+curl --cert /app/data/docker-tls/mission.lan/cert.pem --key /app/data/docker-tls/mission.lan/key.pem https://holdom4.mission.lan:2376/containers/json?all=true
+
+curl --cacert /app/data/docker-tls/ca.pem --cert /app/data/docker-tls/cert.pem --key /app/data/docker-tls/key.pem https://holdom4.mission.lan:2376/containers/json?all=true
+
+
+./kuma_load.py -a http://holdom3.mission.lan:3001 -ukuma -pkuma123 -d
+
+./kuma_load.py -a http://localhost:3001 -ukuma -pkuma123 -d
