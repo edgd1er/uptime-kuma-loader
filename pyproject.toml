@@ -18,7 +18,8 @@ license = {text = "GNU General Public License v3.0" }
 #license-files = ["LICEN[CS]E"]
 
 dependencies = [
-    "uptime-kuma-api",
+    #"uptime-kuma-api",
+    "uptime-kuma-api @ git+https://github.com/edgd1er/uptime-kuma-api@v2-support",
     "tomli"
 ]
 
