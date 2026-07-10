@@ -23,7 +23,7 @@ except Exception:
 try:
   from uptime_kuma_api import UptimeKumaApi, UptimeKumaException
 except Exception:
-  print('Missing UptimeKumaApi, pip install --break-system-packages uptime-kuma-api')
+  print('Missing UptimeKumaApi, python3 -m pip install git+https://github.com/edgd1er/uptime-kuma-api.git@v2-support')
 
 
 class ConfigError(Exception):
@@ -48,13 +48,14 @@ VALID_AUTH_METHODS = {"none", "http_basic", "ntlm", "mtls", "oauth2_cc"}
 
 # functions
 def fix_api():
-  #api L"incident": r2["incident"], - W  #"incident": r2["incidents"],
-  #api LL2173: status_page.pop("maintenanceList"), add status_page.pop("autoRefreshInterval")
-  #analyticsId
-  #data.pop('analyticsId')
-
+  # api L"incident": r2["incident"], - W  #"incident": r2["incidents"],
+  # api LL2173: status_page.pop("maintenanceList"), add status_page.pop("autoRefreshInterval")
+  # analyticsId
+  # data.pop('analyticsId')
 
   pass
+
+
 def get_token_from_kuma_api(kuma_api: "UptimeKumaApi",
                             username: str = "",
                             password: str = "",
@@ -442,7 +443,7 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
       logger.info(f"Added status page {config_by_names[a]['slug']}: {ret['msg']}")
       logger.debug(f"Added status page {config_by_names[a]['slug']}: {ret}")
       # TODO complete processing
-      ret = api.save_status_page(slug= config_by_names[a]['slug'],**config_status_pages)
+      ret = api.save_status_page(slug=config_by_names[a]['slug'], **config_status_pages)
     except Exception as e:
       logger.info(f'Error adding status page {config_by_names[a]["title"]}')
       logger.debug(f'Error adding status page {config_by_names[a]["title"]}: {e}')
@@ -492,9 +493,8 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
       logger.debug(f'Error adding status page {edited["title"]}({edited["id"]}: {e}')
       sys.exit()
 
-
   for s in existing_status_pages:
-      logger.info(f's: {s}')
+    logger.info(f's: {s}')
 
 
 def add_remove_tags(api: 'UptimeKumaApi' = None, config_monitors: Dict[str, Any] = None, delete: bool = False):
@@ -600,6 +600,7 @@ def convert_time_range(thismaintenance) -> Dict[str, Any]:
 
 def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[str, Any] = None,
                         config_maintenance: list[str] = None,
+                        existing_groups: Dict[str, any] = None,
                         existing_monitors: Dict[str, Any] = None,
                         delete: bool = False) -> dict[LiteralString | str, str | Any]:
   """
@@ -651,10 +652,11 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     # extract monitor list id
     if 'monitorslist' in thismaintenance:
       monitors_list = thismaintenance.pop('monitorslist', None)
+      excluded = thismaintenance.pop('excluded', [])
       if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [l['id'] for l in monitors]
+        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded and len(excluded)>0 ]
       else:
-        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list]
+        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list if l['parent'] not in excluded ]
     else:
       monitors_id_list = []
     # add maintenance
@@ -677,15 +679,19 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     id = existing_maintenance_dict[elt]['id']
     thismaintenance = [m for m in config_maintenance if m['title'] == elt][0]
     thismaintenance = convert_time_range(thismaintenance)
+
     # extract monitor list id
+    monitors_id_list = []
     if 'monitorslist' in thismaintenance:
       monitors_list = thismaintenance.pop('monitorslist', None)
+      excluded_names = thismaintenance.pop('excluded', [])
+      excluded = [ existing_groups[e]['id'] for e in excluded_names if e == existing_groups[e]['name'] ]
+
       if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [l['id'] for l in monitors]
-      else:
-        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list]
-    else:
-      monitors_id_list = []
+        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded ]
+      else: #TODO: correct
+        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list and l['parent'] not in excluded ]
+
     # edit maintenance
     result = api.edit_maintenance(id, **thismaintenance)
     logger.info(f"Editing maintenance '{elt}', id={id}, result: {result['msg']}")
@@ -928,6 +934,7 @@ def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run
   existing_maintenance = api.get_maintenances()
   new_maintenance = process_maintenance(api=api, existing_maintenance=existing_maintenance,
                                         config_maintenance=config_maintenance,
+                                        existing_groups=existing_groups,
                                         existing_monitors=existing_monitors, delete=delete)
 
 
@@ -1099,16 +1106,15 @@ def main():
     sys.exit(1)
 
   if args.logfile:
-    #shandler = logging.StreamHandler(sys.stdout)
-    #shandler.setFormatter(formatter)
-    #shandler.setLevel(log_level)
+    # shandler = logging.StreamHandler(sys.stdout)
+    # shandler.setFormatter(formatter)
+    # shandler.setLevel(log_level)
     logger.debug(f'Writing logs to {CDIR}/kuma_load.log')
-    fhandler = logging.FileHandler(filename=CDIR  +"/kuma_load.log", mode='w')
+    fhandler = logging.FileHandler(filename=CDIR + "/kuma_load.log", mode='w')
     fhandler.setLevel(log_level)
     fhandler.setFormatter(formatter)
-    #logger.addHandler(shandler)
+    # logger.addHandler(shandler)
     logger.addHandler(fhandler)
-
 
   logger.setLevel(log_level)
 

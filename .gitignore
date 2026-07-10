@@ -209,3 +209,4 @@ __marimo__/
 /kuma.toml
 
 data/
+compose*.yml

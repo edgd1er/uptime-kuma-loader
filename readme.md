@@ -4,7 +4,10 @@
 
 From toml file, create or update a uptime-kuma site.
 The script is based on uptime-kuma-api's module.
+updatime-kuma-api had to be updated: `python3 -m pip install git+https://github.com/edgd1er/uptime-kuma-api.git@v2-support`
 elements not present in config (toml) or duplicate in database are deleted if -d argument is given.
+
+`pip install .` will install all dependencies
 
 Implemented:
 * monitor
@@ -14,7 +17,7 @@ Implemented:
 * pause/resume
 * maintenance
 
-Not implemented (planned):
+Not implemented (maybe):
 * status page
 * uptime
 * statistics
@@ -30,13 +33,14 @@ Main points:
 - UTF-8 encoded file, extension .toml.
 - Several monitors defined with repeated tables [[monitor]].
 - [[ monitor ]], top level key define a table having at minimum name and [type](https://uptime-kuma-api.readthedocs.io/en/latest/api.html#uptime_kuma_api.MonitorType).
+- other top level keys are maintenance, notification, status, docker
 - groups are also a monitor which type is group.
 - Comments supported with #.
 - Native types TOML : string, integer, boolean, array, table, multiline string ("""...""").
-
+- all keys/values are the one listed in [uptime-kuma-api](https://uptime-kuma-api.readthedocs.io/en/latest/api.html)
 Some key/value pairs were added as not preset in the "add_monitor" function:
-* group
-* active (true = pause). All groups are unpaused.
+  * group
+  * active (true = pause). All groups are unpaused.
 
 Monitor's minimal fields:
   * name (string) — monitor's unique name
