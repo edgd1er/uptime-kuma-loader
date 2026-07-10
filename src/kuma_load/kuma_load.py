@@ -8,6 +8,8 @@ import importlib
 from pathlib import Path
 from typing import List, Dict, Any, Counter, LiteralString, Tuple, Optional
 
+import kuma_load
+
 # try tomllib (Py3.11+), otherwise tomli
 try:
   tomllib = importlib.import_module("tomllib")
@@ -1069,6 +1071,7 @@ def load_toml_config_file(file_path: str) -> tuple[
 def main():
   # set logger
   format = '%(asctime)s - %(levelname)s - %(name)s [%(funcName)s][%(lineno)d] - %(message)s'
+  formatter = logging.Formatter(format)
   logging.basicConfig(format=format, level=logging.INFO)
   logger = logging.getLogger(__name__)
   logger.setLevel(logging.INFO)
@@ -1076,6 +1079,7 @@ def main():
   p = argparse.ArgumentParser(description="Import monitors from TOML into UptimeKuma via UptimeKumaApi")
   p.add_argument("--file", "-f", help="TOML file path", default="kuma.toml")
   p.add_argument("--api-url", "-a", help="UptimeKuma API URL or connection string", default="http://localhost:3001")
+  p.add_argument("--logfile", "-l", help="", default=False, action="store_true")
   p.add_argument("--username", "-u", help="API username", required=True)
   p.add_argument("--password", "-p", help="API password", required=True)
   p.add_argument("--token", "-t", help="API token (alternative to username/password)")
@@ -1085,6 +1089,8 @@ def main():
                  default=False, action="store_true")
   args = p.parse_args()
 
+  log_level = logging.DEBUG if args.verbose else logging.INFO
+
   if args.username and not args.password:
     logger.error("When using --username you must provide --password.")
     sys.exit(1)
@@ -1092,7 +1098,18 @@ def main():
     logger.error("When using --password you must provide --username.")
     sys.exit(1)
 
-  log_level = logging.DEBUG if args.verbose else logging.INFO
+  if args.logfile:
+    #shandler = logging.StreamHandler(sys.stdout)
+    #shandler.setFormatter(formatter)
+    #shandler.setLevel(log_level)
+    logger.debug(f'Writing logs to {CDIR}/kuma_load.log')
+    fhandler = logging.FileHandler(filename=CDIR  +"/kuma_load.log", mode='w')
+    fhandler.setLevel(log_level)
+    fhandler.setFormatter(formatter)
+    #logger.addHandler(shandler)
+    logger.addHandler(fhandler)
+
+
   logger.setLevel(log_level)
 
   ssl_true = True if args.api_url.startswith("https://") else False
