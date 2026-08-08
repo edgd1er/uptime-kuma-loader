@@ -617,6 +617,7 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
   config_maintenance_names = [t['title'] for t in config_maintenance]
   existing_maintenance_dict = {t['title']: t for t in existing_maintenance}
   existing_maintenance_names = [t['title'] for t in existing_maintenance]
+  existing_groups_names = [ v['name'] for k,v in existing_groups.items() ]
 
   # remove duplicate existing maintenance
   c = Counter(existing_maintenance_names)
@@ -634,16 +635,7 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
   edited = []
 
   monitors = api.get_monitors()
-
-  # if required, maintenance is deleted
-  if delete and len(to_delete) > 0:
-    for elt in to_delete:
-      id = [v['id'] for k, v in existing_maintenance_dict.items() if k == elt][0]
-      result = api.delete_maintenance(id_=id)
-      logger.info(f"Deleting removed maintenance '{elt}', id={id}, result: {result['msg']}")
-      logger.debug(f"Deleting removed maintenance '{elt}', id={id}, result: {result}")
-      deleted.append(elt)
-      existing_maintenance_dict.pop(elt)
+  existing_monitors_names = [ v['name'] for k,v in existing_monitors.items() ]
 
   # add existing maintenance
   for elt in to_add:
@@ -652,7 +644,13 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     # extract monitor list id
     if 'monitorslist' in thismaintenance:
       monitors_list = thismaintenance.pop('monitorslist', None)
-      excluded = thismaintenance.pop('excluded', [])
+      excluded_names = thismaintenance.pop('excluded', [])
+      # if parent is in excluded, exclude child
+      excluded = [ existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names ]
+      # if current name is in excluded, exclude current
+      excluded_child = [ v['id'] for k,v in existing_monitors.items() if v['name'] in excluded_names ]
+      excluded.extend(excluded_child)
+
       if str(monitors_list[0]).lower() == 'all':
         monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded and len(excluded)>0 ]
       else:
@@ -685,19 +683,28 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     if 'monitorslist' in thismaintenance:
       monitors_list = thismaintenance.pop('monitorslist', None)
       excluded_names = thismaintenance.pop('excluded', [])
-      excluded = [ existing_groups[e]['id'] for e in excluded_names if e == existing_groups[e]['name'] ]
+      # if parent is in excluded, exclude child
+      excluded = [ existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names ]
+      # if current name is in excluded, exclude current
+      excluded_child = [ v['id'] for k,v in existing_monitors.items() if v['name'] in excluded_names ]
+      excluded.extend(excluded_child)
 
       if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded ]
+        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded and l['id'] not in excluded ]
       else: #TODO: correct
-        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list and l['parent'] not in excluded ]
+        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list and l['parent'] not in excluded and l['id'] not in excluded]
 
     # edit maintenance
-    result = api.edit_maintenance(id, **thismaintenance)
-    logger.info(f"Editing maintenance '{elt}', id={id}, result: {result['msg']}")
-    logger.debug(
-      f'Editing maintenance "{elt}", id={str(id) + "/" + str(result["maintenanceID"])}, result: {result}')
-    edited.append(elt)
+    try:
+      result = api.edit_maintenance(id, **thismaintenance)
+      logger.info(f"Editing maintenance '{elt}', id={id}, result: {result['msg']}")
+      logger.debug(
+        f'Editing maintenance "{elt}", id={str(id) + "/" + str(result["maintenanceID"])}, result: {result}')
+      edited.append(elt)
+    except Exception as e:
+      logger.error(f'Error editing maintenance: {thismaintenance["name"]}, error: {e.getmessage()}')
+      result={}
+
     # update monitors association
     # TODO delete if existing ?
     # current_monitors= api.get_monitor_maintenance(id_=id)
@@ -710,6 +717,16 @@ def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[st
     result = api.add_monitor_maintenance(id_=id, monitors=monitors_id)
     logger.info(f"Adding {len(monitors_id)} monitors to maintenance '{elt}', id={id}, result: {result['msg']}")
     logger.debug(f"Adding monitors {monitors_id} to maintenance '{elt}', id={id}, result: {result}")
+
+  # if required, maintenance is deleted
+  if delete and len(to_delete) > 0:
+    for elt in to_delete:
+      id = [v['id'] for k, v in existing_maintenance_dict.items() if k == elt][0]
+      result = api.delete_maintenance(id_=id)
+      logger.info(f"Deleting removed maintenance '{elt}', id={id}, result: {result['msg']}")
+      logger.debug(f"Deleting removed maintenance '{elt}', id={id}, result: {result}")
+      deleted.append(elt)
+      existing_maintenance_dict.pop(elt)
 
   logger.info(f'added: {len(added)}, deleted: {len(deleted)}, edited: {len(edited)}')
   logger.debug(f'added: {added}, deleted: {deleted}, edited: {edited}')
@@ -937,6 +954,7 @@ def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run
                                         existing_groups=existing_groups,
                                         existing_monitors=existing_monitors, delete=delete)
 
+  logger.debug(f'new_maintenance: {new_maintenance}')
 
 # handle tags
 def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=None, kuma_monitor=None,
