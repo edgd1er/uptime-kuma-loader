@@ -8,9 +8,12 @@ import importlib
 from pathlib import Path
 from typing import List, Dict, Any, Counter, LiteralString, Tuple, Optional
 
-import kuma_load
+from dataclasses import dataclass, field
+from typing import Optional
 
+# =============================================================================
 # try tomllib (Py3.11+), otherwise tomli
+# =============================================================================
 try:
   tomllib = importlib.import_module("tomllib")
 except Exception:
@@ -26,14 +29,37 @@ except Exception:
   print('Missing UptimeKumaApi, python3 -m pip install git+https://github.com/edgd1er/uptime-kuma-api.git@v2-support')
 
 
-class ConfigError(Exception):
+# =============================================================================
+# exception classes
+# =============================================================================
+
+class KumaLoadError(Exception):
+  """Base exception for kuma_load."""
   pass
 
 
-# variables
+class ConfigError(KumaLoadError):
+  """configuration error."""
+  pass
+
+
+class APIError(KumaLoadError):
+  """API error."""
+  pass
+
+class ConnectionError(APIError):
+  """Error connecting to API."""
+  pass
+
+class DataFetchError(APIError):
+  """Error fetching data."""
+  pass
+
+# =============================================================================
+# global variables
+# =============================================================================
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
-# client = docker.from_env()
 LDIR = os.path.dirname(os.path.realpath(__file__))
 CDIR = os.getcwd()
 
@@ -46,7 +72,60 @@ VALID_MONITOR_TYPES = {
 VALID_AUTH_METHODS = {"none", "http_basic", "ntlm", "mtls", "oauth2_cc"}
 
 
+# =============================================================================
+# classes
+# =============================================================================
+
+@dataclass
+class ImportConfig:
+  """
+  loaded configuration structure, from TOML file
+
+  Has all configuration data, better organization, type enforced
+  """
+  monitors: List[Dict[str, Any]] = field(default_factory=list)
+  notifications: List[Dict[str, Any]] = field(default_factory=list)
+  docker_hosts: Optional[Dict[str, Any]] = field(default_factory=list)
+  maintenances: List[Dict[str, Any]] = field(default_factory=list)
+  status_pages: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ExistingState:
+  """
+  Existing state fetched from the UptimeKuma API.
+
+  Organize entities with a name mapping for an access O(1).
+  """
+  monitors: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> monitor
+  groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> group
+  notifications: List[Dict[str, Any]] = field(default_factory=list)
+  docker_hosts: List[Dict[str, Any]] = field(default_factory=list)
+  maintenances: List[Dict[str, Any]] = field(default_factory=list)
+  status_pages: List[Dict[str, Any]] = field(default_factory=list)
+  tags: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> tag
+
+
+@dataclass
+class ProcessedEntities:
+  """
+  Class for processed entities.
+
+  Contient les nouvelles entités créées ou modifiées, avec leurs
+  mappings name -> id pour la résolution des références.
+  """
+  status_pages: Any = None
+  tags: List[Dict[str, Any]] = field(default_factory=list)
+  tags_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> tag dict
+  notifications: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> notification
+  groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> group
+  docker_hosts: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# =============================================================================
 # functions
+# =============================================================================
+
 def fix_api():
   # api L"incident": r2["incident"], - W  #"incident": r2["incidents"],
   # api LL2173: status_page.pop("maintenanceList"), add status_page.pop("autoRefreshInterval")
@@ -88,12 +167,11 @@ def get_token_from_kuma_api(kuma_api: "UptimeKumaApi",
     return tok
 
   except Exception as e:
-    logger.exception("Authentication error")
-    # ne pas faire sys.exit ici : laisser l'appelant gérer l'arrêt
+    logger.error("Authentication error")
     try:
       kuma_api.disconnect()
     except Exception:
-      logger.info("kuma_api.disconnect() failed", exc_info=False)
+      logger.error("kuma_api.disconnect() failed", exc_info=False)
       logger.debug("kuma_api.disconnect() failed", exc_info=True)
     return None
 
@@ -145,8 +223,10 @@ def validate_monitor(m: Dict[str, Any]) -> None:
         raise ConfigError(f"Monitor '{m['name']}': auth_method OAUTH2_CC requires '{key}'.")
 
 
-def load_toml(path: str) -> Tuple[
-  Optional[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+# =============================================================================
+# FONCTION 1 : load config from file
+# =============================================================================
+def load_toml(path: str) -> ImportConfig:
   try:
     with open(path, "rb") as f:
       data = tomllib.load(f)
@@ -155,7 +235,7 @@ def load_toml(path: str) -> Tuple[
   except tomllib.TOMLDecodeError as e:
     raise ConfigError(f"Invalid TOML: {e}") from e
 
-  docker: Optional[Dict[str, Any]] = None
+  docker: Optional[Dict[str, Any]] = []
   monitors: List[Dict[str, Any]] = []
   notifications: List[Dict[str, Any]] = []
   maintenances: List[Dict[str, Any]] = []
@@ -196,9 +276,678 @@ def load_toml(path: str) -> Tuple[
       raise ConfigError("Each monitor must be a table/object")
     validate_monitor(m)
 
-  return docker, monitors, notifications, maintenances, statuses
+  # if empty config
+  if len(monitors) == 0 and len(notifications) == 0:
+    logger.error(
+      f"Empty monitors config ({len(monitors)}) or empty config_notifications ({len(notifications)})")
+    raise ConfigError(
+      "Configuration must contain at least one monitor or notification"
+    )
+
+  return ImportConfig(docker_hosts=docker, monitors=monitors, maintenances=maintenances, status_pages=statuses,
+                      notifications=notifications)
 
 
+# =============================================================================
+# FUNCTION 2 : fetch_existing_state
+# =============================================================================
+
+def fetch_existing_state(api: Optional['UptimeKumaApi']) -> ExistingState:
+  """
+  Récupère l'état existant depuis l'API UptimeKuma.
+
+  Cette fonction centralise tous les appels API pour récupérer l'état
+  actuel de l'instance UptimeKuma.
+
+  Args:
+      api: Instance de UptimeKumaApi (peut être None)
+
+  Lève:
+      ValueError: Si api est None
+      APIError: En cas d'erreur lors de la récupération
+
+  Retourne:
+      ExistingState: Structure contenant toutes les entités existantes
+  """
+  if api is None:
+    raise ValueError("API must not be None")
+
+  try:
+    # Récupérer les moniteurs existants
+    existing_config, existing_monitors = get_monitors(api)
+
+    # Extraire les groupes (qui sont des moniteurs avec type='group')
+    existing_groups = {
+      g['name']: g for g in existing_config if g.get('type') == 'group'
+    }
+
+    # Récupérer les tags
+    existing_tags, _ = get_tags(api)
+    existing_tags_dict = {t['name']: t for t in existing_tags}
+
+    return ExistingState(
+      monitors=existing_monitors,
+      groups=existing_groups,
+      notifications=api.get_notifications(),
+      docker_hosts=api.get_docker_hosts(),
+      maintenances=api.get_maintenances(),
+      status_pages=api.get_status_pages(),
+      tags=existing_tags_dict,
+    )
+
+  except Exception as e:
+    raise APIError(f"Failed to fetch existing state: {e}") from e
+
+
+# =============================================================================
+# FONCTION 3 : process_independent_entities
+# =============================================================================
+
+def process_independent_entities(
+        api: 'UptimeKumaApi',
+        config: ImportConfig,
+        existing: ExistingState,
+        delete: bool
+) -> ProcessedEntities:
+  """
+  process entities that have not links between them.
+  status_pages, tags, notifications, groups, docker
+
+  No order is required.
+
+  :argument api: UptimeKumaApi instance
+  :argument config: loaded configuration
+  :argument existing: existing state
+  :argument delete: if True, delete entities not found in toml file.
+
+  :returns
+      ProcessedEntities: Entités traitées avec leurs mappings
+  """
+
+  # Traiter les status pages
+  new_status_pages = process_status_pages(
+    api=api,
+    config_status_pages=config.status_pages,
+    delete=delete
+  )
+
+  # Traiter les tags
+  new_tags_id, new_tags = add_remove_tags(
+    api=api,
+    config_monitors=config.monitors,
+    delete=delete
+  )
+
+  # Traiter les notifications
+  new_notifications = process_notifications(
+    api=api,
+    existing_notifications=existing.notifications,
+    config_notifications=config.notifications,
+    delete=delete
+  )
+
+  # Extraire les noms des groupes de la config des moniteurs
+  config_groups = {m['group'] for m in config.monitors if 'group' in m}
+
+  # Traiter les groupes
+  new_groups = process_groups(
+    api=api,
+    existing_groups=existing.groups,
+    config_groups=config_groups,
+    delete=delete
+  )
+
+  # Traiter les docker hosts
+  new_docker_hosts = process_docker_hosts(
+    api=api,
+    config_docker_hosts=config.docker_hosts,
+    existing_docker_hosts=existing.docker_hosts,
+    delete=delete
+  )
+
+  return ProcessedEntities(
+    status_pages=new_status_pages,
+    tags=new_tags,
+    tags_id=new_tags_id,
+    notifications=new_notifications,
+    groups=new_groups,
+    docker_hosts=new_docker_hosts,
+  )
+
+
+# =============================================================================
+# FONCTION 4 : resolve_all_references
+# =============================================================================
+
+def resolve_all_references(config: ImportConfig, processed: ProcessedEntities) -> None:
+  """
+
+  Resolve references by names to ids in imported config.
+
+  This function parses all imported config monitors and replace references by names (groupes, docker hosts, notifications)
+  by their corresponding IDs.
+
+  Change in place config.monitors.
+
+  :argument config: Configuration chargée
+  /:argument processed: Entités déjà traitées (contient les mappings name->id)
+
+  Lève:
+      ConfigError: Si une référence n'est pas trouvée
+  """
+  # Créer les mappings name -> id pour un accès rapide
+  docker_name_to_id = {dh['name']: dh['id'] for dh in processed.docker_hosts}
+  notification_name_to_id = {n['name']: n['id'] for n in processed.notifications.values()}
+  group_name_to_id = {name: g['id'] for name, g in processed.groups.items()}
+
+  # CORRECTION BUG #4 : Ne pas modifier la liste pendant itération
+  # Parcourir chaque moniteur et résoudre ses références
+  for monitor in config.monitors:
+
+    # Résoudre docker_host (si c'est une string, la remplacer par l'ID)
+    if 'docker_host' in monitor and isinstance(monitor['docker_host'], str):
+      docker_name = monitor['docker_host']
+      if docker_name not in docker_name_to_id:
+        raise ConfigError(f"Docker host '{docker_name}' not found in existing docker hosts")
+      monitor['docker_host'] = docker_name_to_id[docker_name]
+
+    # Résoudre notificationIDList (si contient des noms, les remplacer par des IDs)
+    if 'notificationIDList' in monitor:
+      resolved_ids = []
+      for notif in monitor['notificationIDList']:
+        if isinstance(notif, str):
+          # C'est un nom de notification
+          if notif not in notification_name_to_id:
+            raise ConfigError(f"Notification '{notif}' not found in existing notifications")
+          resolved_ids.append(notification_name_to_id[notif])
+        else:
+          # C'est déjà un ID
+          resolved_ids.append(notif)
+      monitor['notificationIDList'] = resolved_ids
+
+    # Résoudre le groupe (convertir en parent ID)
+    if 'group' in monitor:
+      group_name = monitor['group']
+      if group_name not in group_name_to_id:
+        raise ConfigError(f"Group '{group_name}' not found in existing groups")
+      monitor['parent'] = group_name_to_id[group_name]
+      # CORRECTION BUG #6 : Supprimer la clé 'group' après résolution
+      monitor.pop('group', None)
+
+
+# =============================================================================
+# FONCTIONS AUXILIAIRES POUR LES MONITEURS
+# =============================================================================
+
+def find_duplicate_monitors(monitor_names: List[str]) -> List[str]:
+  """
+  Trouve les noms de moniteurs dupliqués.
+
+  Args:
+      monitor_names: Liste des noms de moniteurs
+
+  Retourne:
+      Liste des noms qui apparaissent plus d'une fois
+  """
+  c = Counter(monitor_names)
+  return [name for name, count in c.items() if count > 1]
+
+
+# =============================================================================
+# FONCTION 5 : delete_monitors
+# =============================================================================
+
+def delete_monitors(
+        api: 'UptimeKumaApi',
+        existing_monitors: Dict[str, Dict[str, Any]],
+        monitors_to_delete: set
+) -> List[str]:
+  """
+  Supprime les moniteurs non présents dans la configuration.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      existing_monitors: Moniteurs existants (name -> monitor dict)
+      monitors_to_delete: Ensemble des noms de moniteurs à supprimer
+
+  Retourne:
+      Liste des noms de moniteurs supprimés
+  """
+  deleted = []
+
+  for monitor_name in monitors_to_delete:
+    # CORRECTION BUG #5 : Vérifier que le moniteur existe avant d'accéder à [0]
+    if monitor_name not in existing_monitors:
+      logger.warning(f"Monitor '{monitor_name}' not found in existing monitors, skipping deletion")
+      continue
+
+    monitor_info = existing_monitors[monitor_name]
+    monitor_id = monitor_info['id']
+
+    try:
+      result = api.delete_monitor(id_=monitor_id)
+      logger.info(f"Deleting removed monitor '{monitor_name}', id={monitor_id}, result: {result.get('msg', '')}")
+      logger.debug(f"Deleting removed monitor '{monitor_name}', id={monitor_id}, result: {result}")
+      deleted.append(monitor_name)
+    except Exception as e:
+      logger.error(f"Error deleting monitor '{monitor_name}': {e}")
+
+  return deleted
+
+
+# =============================================================================
+# FONCTION 6 : update_existing_monitor
+# =============================================================================
+
+def update_existing_monitor(
+        api: 'UptimeKumaApi',
+        existing_monitor: Dict[str, Any],
+        payload: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+  """
+  Met à jour un moniteur existant.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      existing_monitor: Moniteur existant (avec id, name, etc.)
+      payload: Données à mettre à jour
+
+  Retourne:
+      Dict avec les infos du moniteur mis à jour, ou None en cas d'erreur
+  """
+  mon_id = existing_monitor['id']
+  monitor_name = existing_monitor['name']
+
+  try:
+    result = api.edit_monitor(mon_id, **payload)
+    logger.info(f"Updating monitor '{monitor_name}', id={mon_id}, result: {result.get('msg', '')}")
+    logger.debug(f"Updating monitor '{monitor_name}', id={mon_id}, result: {result}, payload: {payload}")
+
+    # Récupérer les infos complètes du moniteur
+    kuma_monitor = api.get_monitor(id_=result.get('monitorID', mon_id))
+    return kuma_monitor
+
+  except Exception as e:
+    logger.error(f"Error updating monitor '{monitor_name}': {e}")
+    logger.debug(f"Error updating monitor '{monitor_name}', payload: {payload}, exception: {e}")
+    return None
+
+
+# =============================================================================
+# FONCTION 7 : create_new_monitor
+# =============================================================================
+
+def create_new_monitor(
+        api: 'UptimeKumaApi',
+        payload: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+  """
+  Crée un nouveau moniteur.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      payload: Données du moniteur à créer
+
+  Retourne:
+      Dict avec les infos du moniteur créé, ou None en cas d'erreur
+  """
+  monitor_name = payload.get('name', 'unknown')
+
+  try:
+    result = api.add_monitor(**payload)
+    logger.info(
+      f"Creating monitor '{monitor_name}', id={result.get('monitorID', 'unknown')}, result: {result.get('msg', '')}")
+    logger.debug(f"Creating monitor '{monitor_name}', result: {result}, payload: {payload}")
+
+    # Récupérer les infos complètes du moniteur
+    kuma_monitor = api.get_monitor(id_=result.get('monitorID'))
+    return kuma_monitor
+
+  except Exception as e:
+    logger.error(f"Error creating monitor '{monitor_name}': {e}")
+    logger.debug(f"Error creating monitor '{monitor_name}', payload: {payload}, exception: {e}")
+    return None
+
+
+# =============================================================================
+# FONCTION 8 : resume_monitor_if_needed
+# =============================================================================
+
+def resume_monitor_if_needed(
+        api: 'UptimeKumaApi',
+        kuma_monitor: Dict[str, Any],
+        is_paused: bool,
+        monitors_paused: List[str]
+) -> None:
+  """
+  Reprend un moniteur s'il n'est pas dans la liste des paused.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      kuma_monitor: Moniteur Kuma (avec id, name, etc.)
+      is_paused: Si True, le moniteur doit être paused
+      monitors_paused: Liste des noms de moniteurs à pauser
+  """
+  if kuma_monitor is None:
+    return
+
+  monitor_name = kuma_monitor.get('name', '')
+  monitor_id = kuma_monitor['id']
+
+  # CORRECTION BUG #7 : Utiliser '' comme valeur par défaut au lieu de []
+  # et vérifier que mon_id est défini
+  if is_paused:
+    # Ce moniteur doit être paused, il sera traité plus tard
+    monitors_paused.append(monitor_name)
+  elif monitor_name not in monitors_paused:
+    # Ce moniteur n'est pas paused, le reprendre
+    try:
+      result = api.resume_monitor(monitor_id)
+      logger.debug(f'Resumed monitor {monitor_name}: {result}')
+    except Exception as e:
+      logger.exception(f'Error resuming monitor {monitor_name}: {e}')
+
+
+# =============================================================================
+# FONCTION 9 : update_monitor_tags
+# =============================================================================
+
+def update_monitor_tags_for_config(
+        api: 'UptimeKumaApi',
+        kuma_monitor: Dict[str, Any],
+        config_tags: List[str],
+        new_tags_id: Dict[str, Dict[str, Any]],
+        delete: bool = False
+) -> None:
+  """
+  Met à jour les tags d'un moniteur selon la configuration.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      kuma_monitor: Moniteur Kuma (avec id, name, tags, etc.)
+      config_tags: Liste des noms de tags de la configuration
+      new_tags_id: Mapping name -> tag dict
+      delete: Si True, supprime les tags non présents
+  """
+  if not config_tags:
+    return
+
+  monitor_id = kuma_monitor['id']
+
+  # CORRECTION BUG #3 : Utiliser .get() pour accéder à 'tags'
+  existing_tags = kuma_monitor.get('tags', [])
+  existing_tag_ids = {t.get('tag_id') for t in existing_tags if 'tag_id' in t}
+
+  # Résoudre les noms de tags en IDs
+  tag_ids = []
+  for tag_name in config_tags:
+    if tag_name in new_tags_id:
+      tag_ids.append(new_tags_id[tag_name]['id'])
+
+  # Ajouter les nouveaux tags
+  for tag_id in tag_ids:
+    if tag_id not in existing_tag_ids:
+      try:
+        api.add_monitor_tag(tag_id=tag_id, monitor_id=monitor_id)
+        logger.info(f"Added tag {tag_id} to monitor {monitor_id}")
+      except Exception as e:
+        logger.error(f"Error adding tag {tag_id} to monitor {monitor_id}: {e}")
+
+  # TODO: Implémenter la suppression des tags si delete=True
+
+
+# =============================================================================
+# FONCTION 10 : process_single_monitor
+# =============================================================================
+
+def process_single_monitor(
+        api: 'UptimeKumaApi',
+        monitor_config: Dict[str, Any],
+        existing_monitors: Dict[str, Dict[str, Any]],
+        new_groups: Dict[str, Dict[str, Any]],
+        new_tags_id: Dict[str, Dict[str, Any]],
+        dry_run: bool,
+        monitors_paused: List[str],
+        monitor_processed: List[str]
+) -> Optional[Dict[str, Any]]:
+  """
+  Traite un seul moniteur de la configuration.
+
+  Cette fonction gère :
+  - La normalisation du moniteur
+  - La gestion des groupes
+  - La gestion de l'état paused
+  - La création ou la mise à jour
+  - L'application des tags
+
+  Args:
+      api: Instance de UptimeKumaApi
+      monitor_config: Configuration du moniteur (dict)
+      existing_monitors: Moniteurs existants (name -> monitor dict)
+      new_groups: Groupes traités (name -> group dict)
+      new_tags_id: Tags traités (name -> tag dict)
+      dry_run: Si True, n'applique pas les changements
+      monitors_paused: Liste des moniteurs à pauser (modifiée en place)
+      monitor_processed: Liste des moniteurs traités (modifiée en place)
+
+  Retourne:
+      kuma_monitor: Moniteur Kuma créé/mis à jour, ou None en cas d'erreur
+  """
+
+  name = monitor_config['name']
+
+  # CORRECTION BUG #6 : Initialiser mon_id à None
+  mon_id = None
+  kuma_monitor = None
+
+  # Normaliser le moniteur
+  payload = normalize_monitor_for_api(monitor_config)
+
+  # Gérer le groupe
+  if 'group' in monitor_config:
+    payload['parent'] = new_groups[monitor_config['group']]['id']
+    payload.pop('group', None)
+
+  # Gérer l'état paused
+  is_paused = monitor_config.get('active') is False
+  if 'active' in payload:
+    payload.pop('active', None)
+
+  # Gestion des tags
+  config_tags = payload.pop('tags', [])
+
+  # Mode dry-run
+  if dry_run:
+    if name in existing_monitors:
+      logger.info(
+        f"[DRY-RUN] Would update monitor '{name}' "
+        f"(id={existing_monitors[name]['id']}) with payload: {payload}"
+      )
+    else:
+      logger.info(f"[DRY-RUN] Would create monitor '{name}' with payload: {payload}")
+    return None
+
+  # Créer ou mettre à jour le moniteur
+  if name in existing_monitors:
+    kuma_monitor = update_existing_monitor(api, existing_monitors[name], payload)
+    if kuma_monitor:
+      mon_id = kuma_monitor['id']
+      monitor_processed.append(name)
+  else:
+    kuma_monitor = create_new_monitor(api, payload)
+    if kuma_monitor:
+      mon_id = kuma_monitor['id']
+      monitor_processed.append(name)
+
+  # Reprendre le moniteur s'il n'est pas paused
+  if kuma_monitor:
+    resume_monitor_if_needed(api, kuma_monitor, is_paused, monitors_paused)
+
+    # Appliquer les tags
+    update_monitor_tags_for_config(api, kuma_monitor, config_tags, new_tags_id)
+
+  return kuma_monitor
+
+
+# =============================================================================
+# FONCTION 11 : process_all_monitors
+# =============================================================================
+
+def process_all_monitors(
+        api: 'UptimeKumaApi',
+        config: ImportConfig,
+        existing: ExistingState,
+        processed: ProcessedEntities,
+        delete: bool,
+        dry_run: bool
+) -> Tuple[List[str], List[str]]:
+  """
+  Traite tous les moniteurs de la configuration.
+
+  Cette fonction orchestre :
+  - L'identification des changements (à ajouter, supprimer, modifier)
+  - La suppression des moniteurs non présents
+  - Le traitement de chaque moniteur
+
+  Args:
+      api: Instance de UptimeKumaApi
+      config: Configuration chargée
+      existing: État existant
+      processed: Entités déjà traitées
+      delete: Si True, supprime les moniteurs non présents
+      dry_run: Si True, n'applique pas les changements
+
+  Retourne:
+      Tuple de (monitors_paused, monitor_processed)
+  """
+  existing_monitors = existing.monitors
+
+  # Identifier les changements
+  # CORRECTION : Filtrer les groupes pour ne garder que les moniteurs
+  existing_monitor_names = [
+    name for name, mon in existing_monitors.items()
+    if mon.get('type') != 'group'
+  ]
+  config_monitor_names = [m['name'] for m in config.monitors]
+
+  to_delete = set(existing_monitor_names) - set(config_monitor_names)
+  to_add = set(config_monitor_names) - set(existing_monitor_names)
+  to_edit = set(config_monitor_names) & set(existing_monitor_names)
+
+  # Détecter les doublons
+  duplicates = find_duplicate_monitors(existing_monitor_names)
+  if duplicates:
+    logger.info(f"Duplicate monitors found: {duplicates}")
+
+  # Supprimer les moniteurs non présents dans la config
+  monitors_paused: List[str] = []
+  monitor_processed: List[str] = []
+
+  if delete and to_delete:
+    deleted = delete_monitors(api, existing_monitors, to_delete)
+    logger.info(f"Deleted {len(deleted)} monitors: {deleted}")
+
+  # Traiter chaque moniteur de la config
+  for monitor_config in config.monitors:
+    process_single_monitor(
+      api=api,
+      monitor_config=monitor_config,
+      existing_monitors=existing_monitors,
+      new_groups=processed.groups,
+      new_tags_id=processed.tags_id,
+      dry_run=dry_run,
+      monitors_paused=monitors_paused,
+      monitor_processed=monitor_processed,
+    )
+
+  logger.info(
+    f"Monitors processed: {len(monitor_processed)}, "
+    f"Paused: {len(monitors_paused)}, "
+    f"Added: {len(to_add)}, Edited: {len(to_edit)}, Deleted: {len(to_delete if delete else set())}"
+  )
+
+  return monitors_paused, monitor_processed
+
+
+# =============================================================================
+# FONCTION 12 : resume_paused_groups
+# =============================================================================
+
+def resume_paused_groups(
+        api: 'UptimeKumaApi',
+        new_groups: Dict[str, Dict[str, Any]]
+) -> None:
+  """
+  Reprend tous les groupes qui ont été créés.
+
+  Les groupes sont créés paused par défaut dans Uptime Kuma,
+  donc on les reprend après leur création.
+
+  Args:
+      api: Instance de UptimeKumaApi
+      new_groups: Groupes créés (name -> group dict)
+  """
+  for group_name, group_info in new_groups.items():
+    try:
+      group_id = group_info.get('id')
+      if group_id:
+        result = api.resume_monitor(group_id)
+        logger.info(f"Resumed group '{group_name}' (id={group_id}), result: {result.get('msg', '')}")
+    except Exception as e:
+      logger.exception(f"Cannot resume group '{group_name}': {e}")
+
+
+# =============================================================================
+# FONCTION 13 : finalize_import
+# =============================================================================
+
+def finalize_import(
+        api: 'UptimeKumaApi',
+        config: ImportConfig,
+        existing: ExistingState,
+        processed: ProcessedEntities,
+        monitors_paused: List[str],
+        dry_run: bool,
+        delete: bool
+) -> None:
+  """
+  Finalize import with post-treatment.
+
+  :arg api: Instance de UptimeKumaApi
+  :arg existing: existinf state
+  :arg processed: entities provessed!
+  :arg monitors_paused: List of monitors to pause
+  :arg dry_run: Si True, n'applique pas les changements
+  :arg delete: if True, delete monitors not in config
+  """
+
+  # Reprendre tous les groupes paused
+  resume_paused_groups(api, processed.groups)
+
+  # Traiter les moniteurs paused
+  if monitors_paused:
+    processed_monitors_paused(api=api, monitors_paused=monitors_paused, dry_run=dry_run)
+
+  # Traiter les maintenances (doit être après les moniteurs et groupes)
+  existing_maintenance = existing.maintenances
+  config_maintenance = config.maintenances
+
+  # CORRECTION : Passer les bonnes références
+  new_maintenance = process_maintenance(
+    api=api,
+    existing_maintenance=existing_maintenance,
+    config_maintenance=config_maintenance,
+    existing_groups=existing.groups,
+    existing_monitors=existing.monitors,
+    delete=delete
+  )
+
+  logger.info(f"Maintenance processed: {len(new_maintenance)} items")
+
+
+# =============================================================================
+# FUNCTION : normalize_monitor_for_api
+# =============================================================================
 def normalize_monitor_for_api(m: Dict[str, Any]) -> Dict[str, Any]:
   out = dict(m)  # shallow copy
   # out['type'] =f'MonitorType.{out["type"]}'
@@ -213,11 +962,16 @@ def normalize_monitor_for_api(m: Dict[str, Any]) -> Dict[str, Any]:
   return out
 
 
-# -----------------------------------------------------------
-# TODO Test
+# =============================================================================
+# FUNCTION : process_notifications
+# =============================================================================
 def process_notifications(api: "UptimeKumaApi" = None, existing_notifications: list[Dict[str, Any]] = None,
                           config_notifications: list[Dict[str, Any]] = None, delete: bool = False) -> dict[
   Any, dict[str, Any] | Any]:
+
+  if api is None:
+    raise ValueError("api must not be None")
+
   new_notifications = {}
   existing_notifications_names = [e['name'] for e in existing_notifications]
   existing_notifications_dict = {e['name']: e for e in existing_notifications}
@@ -274,9 +1028,12 @@ def process_notifications(api: "UptimeKumaApi" = None, existing_notifications: l
 
   logger.debug(
     f'edited: {len(actions["edited"])}, {actions["edited"]}, added: {len(actions["added"])}, {actions["added"]}, deleted: {len(actions["deleted"])}, {actions["deleted"]}')
-  return {n['name']: n for n in existing_notifications}
+  return existing_notifications_dict
 
 
+# =============================================================================
+# FUNCTION : process_groups
+# =============================================================================
 def process_groups(api: UptimeKumaApi = None, existing_groups=None, config_groups=None, delete: bool = False) -> dict:
   """
   create groups not present un kuma, delete groups not present in config
@@ -289,6 +1046,10 @@ def process_groups(api: UptimeKumaApi = None, existing_groups=None, config_group
 
   added = []
   deleted = []
+
+  if api is None:
+    raise ValueError(f'api must not be None')
+
   # add missing groups first
   existing_group_names = [g for g in existing_groups]
   logger.debug(f'config_groups: {len(config_groups)}, config_groups: {config_groups}')
@@ -323,12 +1084,16 @@ def process_groups(api: UptimeKumaApi = None, existing_groups=None, config_group
   return existing_groups
 
 
+# =============================================================================
+# FUNCTION : process_docker_hosts
+# =============================================================================
 def process_docker_hosts(
         api: "UptimeKumaApi",
         config_docker_hosts: Optional[List[Dict[str, Any]]] = None,
         existing_docker_hosts: Optional[List[Dict[str, Any]]] = None,
         delete: bool = False,
 ) -> List[Dict[str, Any]]:
+
   if api is None:
     raise ValueError("api must not be None")
 
@@ -397,12 +1162,16 @@ def process_docker_hosts(
   return api.get_docker_hosts()
 
 
-def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[str, Any] = None,
+# =============================================================================
+# FUNCTION : process_status_pages
+# =============================================================================
+def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[str, Any] = {},
                          delete: bool = False) -> List[Dict[str, Any]]:
   if api is None:
     raise ValueError("api must not be None")
 
-  config = config_status_pages or []
+  config = [] if config_status_pages is None else config_status_pages
+  processed_status_pages=[]
 
   existing_status_pages = []
   try:
@@ -410,7 +1179,7 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
   except Exception as e:
     logger.error(f'get_status_pages: {e}')
 
-  if len(existing_status_pages) == 0 and len(config_status_pages) == 0:
+  if len(existing_status_pages) == 0 and len(config) == 0:
     return []
 
   to_add = set({s['slug'] for s in config}) - set({s['slug'] for s in existing_status_pages})
@@ -434,7 +1203,7 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
         logger.debug(f"Error on deletion status page {slug}, ret: {ret}")
 
     except Exception as e:
-      logger.info(f'Error deleting status page {slug}')
+      logger.error(f'Error deleting status page {slug}')
       logger.debug(f'Error deleting status page {slug}: {e}')
 
   for a in to_add:
@@ -442,12 +1211,13 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
       ret = api.add_status_page(slug=config_by_names[a]['slug'], title=config_by_names[a].get('title'))
       logger.info(f"Added status page {config_by_names[a]['slug']}: {ret['msg']}")
       logger.debug(f"Added status page {config_by_names[a]['slug']}: {ret}")
-      # TODO complete processing
-      ret = api.save_status_page(slug=config_by_names[a]['slug'], **config_status_pages)
+      ret = api.save_status_page(slug=config_by_names[a]['slug'], **config_by_names[a])
+      if ret['msg'] == "Added":
+        processed_status_pages.append(config_by_names[a])
+
     except Exception as e:
-      logger.info(f'Error adding status page {config_by_names[a]["title"]}')
+      logger.error(f'Error adding status page {config_by_names[a]["title"]}')
       logger.debug(f'Error adding status page {config_by_names[a]["title"]}: {e}')
-      sys.exit()
 
   for e in to_edit:
     id = existing_status_pages_names[e].get('id')
@@ -488,15 +1258,21 @@ def process_status_pages(api: 'UptimeKumaApi' = None, config_status_pages: Dict[
       ret = api.save_status_page(**edited)
       logger.info(f"Added status page {edited['slug']}: {ret}")
       logger.debug(f"Added status page {edited['slug']}: {ret}")
+      if type(ret) == list:
+        processed_status_pages.append(edited)
     except Exception as e:
-      logger.info(f'Error adding status page {edited["title"]}({edited["id"]})')
+      logger.error(f'Error adding status page {edited["title"]}({edited["id"]})')
       logger.debug(f'Error adding status page {edited["title"]}({edited["id"]}: {e}')
-      sys.exit()
+      raise APIError(f'Error adding status page {edited["title"]}({edited["id"]}')
 
   for s in existing_status_pages:
     logger.info(f's: {s}')
 
+  return processed_status_pages
 
+# =============================================================================
+# FUNCTION : add_remove_tags
+# =============================================================================
 def add_remove_tags(api: 'UptimeKumaApi' = None, config_monitors: Dict[str, Any] = None, delete: bool = False):
   """
   add missing tags, delete not used tags, delete duplicates.
@@ -573,390 +1349,9 @@ def add_remove_tags(api: 'UptimeKumaApi' = None, config_monitors: Dict[str, Any]
   return new_tags_id, existing_tags
 
 
-def replace_tag_names_with_id(config_tags: list[str], existing_tags: Dict[str, Any]) -> list[int]:
-  tags_id = []
-  for ctag in config_tags:
-    for d in existing_tags:
-      if d['name'] == ctag:
-        tags_id.append(d['id'])
-
-  tags_id2 = [d['id'] for ctag in config_tags for d in existing_tags if d['name'] == ctag]
-  logger.debug(f'tags_id2: {tags_id2}, tags_id: {tags_id}')
-  return tags_id
-
-
-def convert_time_range(thismaintenance) -> Dict[str, Any]:
-  if 'timeRange' not in thismaintenance.keys():
-    return thismaintenance
-
-  new_time_range = []
-  for elt in thismaintenance["timeRange"]:
-    splitted = elt.split(':')
-    new_time_range.append({"hours": int(splitted[0]), "minutes": int(splitted[1]), "seconds": int(splitted[2])})
-  thismaintenance['timeRange'] = new_time_range
-
-  return thismaintenance
-
-
-def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[str, Any] = None,
-                        config_maintenance: list[str] = None,
-                        existing_groups: Dict[str, any] = None,
-                        existing_monitors: Dict[str, Any] = None,
-                        delete: bool = False) -> dict[LiteralString | str, str | Any]:
-  """
-  add/edit/delete maintenance
-  update monitors attached to a maintenance
-  :param api:
-  :param existing_maintenance:
-  :param config_maintenance:
-  :param existing_monitors:
-  :param delete:
-  :return:
-  """
-  config_maintenance_dict = {t['title']: t for t in config_maintenance}
-  config_maintenance_names = [t['title'] for t in config_maintenance]
-  existing_maintenance_dict = {t['title']: t for t in existing_maintenance}
-  existing_maintenance_names = [t['title'] for t in existing_maintenance]
-  existing_groups_names = [ v['name'] for k,v in existing_groups.items() ]
-
-  # remove duplicate existing maintenance
-  c = Counter(existing_maintenance_names)
-  logger.debug(f'maintenance counter: {c}')
-  duplicates = {k: v for k, v in c.items() if v > 1}
-  logger.info(f'duplicate maintenance found: {len(duplicates)}')
-  logger.debug(f'duplicate maintenance found: {len(duplicates)}, {duplicates}')
-
-  to_add = set(config_maintenance_names) - set(existing_maintenance_names)
-  to_delete = set(existing_maintenance_names) - set(config_maintenance_names)
-  to_edit = set(config_maintenance_names) & set(existing_maintenance_names)
-
-  added = []
-  deleted = []
-  edited = []
-
-  monitors = api.get_monitors()
-  existing_monitors_names = [ v['name'] for k,v in existing_monitors.items() ]
-
-  # add existing maintenance
-  for elt in to_add:
-    thismaintenance = [m for m in config_maintenance if m['title'] == elt][0]
-    thismaintenance = convert_time_range(thismaintenance)
-    # extract monitor list id
-    if 'monitorslist' in thismaintenance:
-      monitors_list = thismaintenance.pop('monitorslist', None)
-      excluded_names = thismaintenance.pop('excluded', [])
-      # if parent is in excluded, exclude child
-      excluded = [ existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names ]
-      # if current name is in excluded, exclude current
-      excluded_child = [ v['id'] for k,v in existing_monitors.items() if v['name'] in excluded_names ]
-      excluded.extend(excluded_child)
-
-      if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded and len(excluded)>0 ]
-      else:
-        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list if l['parent'] not in excluded ]
-    else:
-      monitors_id_list = []
-    # add maintenance
-    result = api.add_maintenance(**thismaintenance)
-    id = result['maintenanceID']
-    logger.info(f"Adding maintenance '{elt}', id={id}, result: {result['msg']}")
-    logger.debug(f"Adding maintenance '{elt}', id={id}, result: {result}")
-    existing_maintenance_dict[elt] = result
-    added.append(elt)
-    # update monitors association
-    monitors_id = []
-    for l in monitors_id_list:
-      monitors_id.append({'id': l})
-    result = api.add_monitor_maintenance(id_=id, monitors=monitors_id)
-    logger.info(f"Adding {len(monitors_id)} monitors to maintenance '{elt}', id={id}, result: {result['msg']}")
-    logger.debug(f"Adding monitors {monitors_id} to maintenance '{elt}', id={id}, result: {result}")
-
-  # edit existing maintenance
-  for elt in to_edit:
-    id = existing_maintenance_dict[elt]['id']
-    thismaintenance = [m for m in config_maintenance if m['title'] == elt][0]
-    thismaintenance = convert_time_range(thismaintenance)
-
-    # extract monitor list id
-    monitors_id_list = []
-    if 'monitorslist' in thismaintenance:
-      monitors_list = thismaintenance.pop('monitorslist', None)
-      excluded_names = thismaintenance.pop('excluded', [])
-      # if parent is in excluded, exclude child
-      excluded = [ existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names ]
-      # if current name is in excluded, exclude current
-      excluded_child = [ v['id'] for k,v in existing_monitors.items() if v['name'] in excluded_names ]
-      excluded.extend(excluded_child)
-
-      if str(monitors_list[0]).lower() == 'all':
-        monitors_id_list = [l['id'] for l in monitors if l['parent'] not in excluded and l['id'] not in excluded ]
-      else: #TODO: correct
-        monitors_id_list = [l['id'] for l in monitors if l['name'] in monitors_list and l['parent'] not in excluded and l['id'] not in excluded]
-
-    # edit maintenance
-    try:
-      result = api.edit_maintenance(id, **thismaintenance)
-      logger.info(f"Editing maintenance '{elt}', id={id}, result: {result['msg']}")
-      logger.debug(
-        f'Editing maintenance "{elt}", id={str(id) + "/" + str(result["maintenanceID"])}, result: {result}')
-      edited.append(elt)
-    except Exception as e:
-      logger.error(f'Error editing maintenance: {thismaintenance["name"]}, error: {e.getmessage()}')
-      result={}
-
-    # update monitors association
-    # TODO delete if existing ?
-    # current_monitors= api.get_monitor_maintenance(id_=id)
-    # current_monitors_id = [ c['id'] for c in current_monitors ]
-    # to_delete = monitors_id_list - current_monitors_id
-    # result = api.
-    monitors_id = []
-    for l in monitors_id_list:
-      monitors_id.append({'id': l})
-    result = api.add_monitor_maintenance(id_=id, monitors=monitors_id)
-    logger.info(f"Adding {len(monitors_id)} monitors to maintenance '{elt}', id={id}, result: {result['msg']}")
-    logger.debug(f"Adding monitors {monitors_id} to maintenance '{elt}', id={id}, result: {result}")
-
-  # if required, maintenance is deleted
-  if delete and len(to_delete) > 0:
-    for elt in to_delete:
-      id = [v['id'] for k, v in existing_maintenance_dict.items() if k == elt][0]
-      result = api.delete_maintenance(id_=id)
-      logger.info(f"Deleting removed maintenance '{elt}', id={id}, result: {result['msg']}")
-      logger.debug(f"Deleting removed maintenance '{elt}', id={id}, result: {result}")
-      deleted.append(elt)
-      existing_maintenance_dict.pop(elt)
-
-  logger.info(f'added: {len(added)}, deleted: {len(deleted)}, edited: {len(edited)}')
-  logger.debug(f'added: {added}, deleted: {deleted}, edited: {edited}')
-
-  return existing_maintenance_dict
-
-
-def processed_monitors_paused(api: 'UptimeKumaApi', monitors_paused: list[str], dry_run: bool = True):
-  if len(monitors_paused) == 0:
-    return
-  try:
-    kuma_monitors = api.get_monitors()
-  except Exception as e:
-    logger.exception(f'Cannot get monitors: {e}')
-
-  monitor_paused_id = [(k.get('id'), k.get('name')) for k in kuma_monitors if k.get('name') in monitors_paused]
-  for id, name in monitor_paused_id:
-    try:
-      result = api.pause_monitor(id)
-      logger.info(f'Monitor {name} ({id}): {result['msg']}')
-    except Exception as e:
-      logger.error(f'pause_monitor {id}, {name}: {e}')
-
-
-def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run: bool = False,
-                            delete: bool = False) -> None:
-  """
-  import toml config into uptimekuma
-  :param file_path: toml config file path
-  :param api: UptimeKumaApi
-  :param dry_run: if true do not import
-  :param delete: if true, delete monitors not present in toml files
-  """
-  e, config_docker_hosts, config_monitors, config_notifications, config_maintenance, config_status_pages = load_toml_config_file(
-    file_path)
-  if e is not None:
-    logger.error(f"Failed to load monitors: {e}")
-    sys.exit(4)
-  if len(config_monitors) == 0 and len(config_notifications) == 0:
-    logger.error(
-      f"Empty monitors config ({len(config_monitors)}) or empty config_notifications ({len(config_notifications)})")
-    sys.exit(4)
-
-  existing_config, existing_monitors = get_monitors(api)
-  existing_groups = {g['name']: g for g in existing_config if 'group' == g['type']}
-  logger.debug(f'existing_groups: {existing_groups}')
-  logger.info(f'existing_groups: {len(existing_groups)}')
-
-  new_statuses_pages = process_status_pages(api=api, config_status_pages=config_status_pages, delete=delete)
-
-  # add/remove tags
-  new_tags_id, new_tags = add_remove_tags(api=api, config_monitors=config_monitors, delete=delete)
-
-  # add/remove/edit Notifications
-  existing_notifications = api.get_notifications()
-  new_notifications = process_notifications(api=api, existing_notifications=existing_notifications,
-                                            config_notifications=config_notifications, delete=delete)
-
-  # add/remove Groups
-  config_groups = set([g['group'] for g in config_monitors if 'group' in g.keys()])
-  new_groups = process_groups(api=api, existing_groups=existing_groups, config_groups=config_groups, delete=delete)
-
-  # récupérer et synchroniser les docker hosts
-  existing_docker_hosts = api.get_docker_hosts()
-  new_docker_hosts = process_docker_hosts(api=api, config_docker_hosts=config_docker_hosts,
-                                          existing_docker_hosts=existing_docker_hosts, delete=delete)
-
-  # construire index name -> id pour lookup O(1)
-  name_to_id = {dh['name']: dh['id'] for dh in new_docker_hosts}
-
-  # remplacer docker_host (si string) par son id, en validant l'existence
-  for c in config_monitors:
-    name = c.get("docker_host")
-    if isinstance(name, str):
-      docker_id = name_to_id.get(name)
-      if docker_id is None:
-        raise ConfigError(f"Docker host named '{name}' not found")
-      c['docker_host'] = docker_id
-
-  # add/edit/delete containers
-  # TODO
-
-  # Look for duplicate monitor and delete them if required
-  existing_monitor_ids = [existing_monitors[e]['id'] for e in existing_monitors]
-  # groups are returned with monitors, filtering them out
-  existing_monitor_names = [existing_monitors[e]['name'] for e, v in existing_monitors.items() if v['type'] != 'group']
-  config_monitor_names = [e['name'] for e in config_monitors]
-
-  to_delete = set(existing_monitor_names) - set(config_monitor_names)
-  to_add = set(config_monitor_names) - set(existing_monitor_names)
-  to_edit = set(config_monitor_names) & set(existing_monitor_names)
-  c = Counter(existing_monitor_names)
-
-  # remove duplicate monitors
-  # logger.debug(f'counter: {c}')
-  duplicates = [k for k, v in c.items() if v > 1]
-  logger.debug(f'duplicates found: {duplicates}')
-  # c = Counter([e for e in existing_monitors])
-
-  logger.debug(
-    f'monitor to_add: {len(to_add)}, {to_add}, to_delete: {len(to_delete)}, {to_delete}, to_edit: {len(to_edit)}, {to_edit}')
-  logger.info(f'monitor to_add: {len(to_add)}, to_delete: {len(to_delete)}, to_edit: {len(to_edit)}')
-  added = []
-  edited = []
-  deleted = []
-
-  if delete and len(to_delete) > 0:
-    for elt in to_delete:
-      id = [v['id'] for k, v in existing_monitors.items() if k == elt][0]
-      result = api.delete_monitor(id_=id)
-      logger.info(f"Deleting removed monitor '{elt}', id={id}, result: {result['msg']}")
-      logger.debug(f"Deleting removed monitor '{elt}', id={id}, result: {result}")
-      deleted.append(elt)
-
-  # Monitors
-  monitor_processed = []
-  monitors_paused = []
-  for m in config_monitors:
-
-    # then monitors
-    logger.debug(f'monitor m: {m}')
-    id_tags = []
-    mon_id = None
-    name = m["name"]
-    monitor_toml_tags = m["tags"] if "tags" in m.keys() else []
-    # replace notification name with ids
-    new_notification_ids_list = []
-    if "notificationIDList" in m.keys():
-      for notif in m["notificationIDList"]:
-        m["notificationIDList"].remove(notif)
-        new_notification_ids_list.append(new_notifications[notif]['id'])
-      m["notificationIDList"] = new_notification_ids_list
-    else:
-      m["notificationIDList"] = []
-    payload = normalize_monitor_for_api(m)
-
-    # add group if required
-    if 'group' in m.keys():
-      # add the new group id to current monitor, parent is the attribute name
-      payload['parent'] = new_groups[m['group']]['id']
-      logger.debug(f"adding parent '{m['group']}' to {name}")
-    # group is not a monitor attribute
-    payload.pop("group", None)
-
-    # save paused monitor for later use
-    if 'active' in payload.keys():
-      if payload['active'] == False:
-        logger.debug(f'Adding {name} to paused monitors ({monitors_paused})')
-        monitors_paused.append(payload['name'])
-      payload.pop('active', None)
-
-    if dry_run:
-      if name in existing_monitors:
-        logger.info(
-          f"[DRY-RUN] Would update monitor '{name}' (id={existing_monitors[name]['id']}) with payload: {payload}")
-      else:
-        logger.info(f"[DRY-RUN] Would create monitor '{name}' with payload: {payload}")
-      continue
-
-    # save tags for later, remove from payloads as tag are traeted separately
-    if "tags" in payload.keys():
-      payload_tags = payload['tags']
-      # replace_tag_names_with_id(payload['tags'], existing_tags))
-      payload.pop("tags", None)
-    else:
-      payload_tags = []
-
-    # update monitor
-    if name in existing_monitors:
-      mon_id = existing_monitors[name]["id"]
-      try:
-        result = api.edit_monitor(mon_id, **payload)
-        logger.info(f"Updating monitor '{name}', id={mon_id}, result: {result['msg']}")
-        logger.debug(f"Updating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
-        mon_id = result["monitorID"]
-        monitor_processed.append(name)
-        kuma_monitor = api.get_monitor(id_=mon_id)
-      except Exception as e:
-        logger.error(f"Error updating monitor '{name}': {e}")
-        logger.debug(f"Error updating monitor '{name}', payload: {payload}, exception: {e}")
-    else:
-      # create monitor
-      try:
-        result = api.add_monitor(**payload)
-        logger.info(f"Creating monitor '{name}', id={mon_id}, result: {result['msg']}")
-        logger.debug(f"Creating monitor '{name}', id={mon_id}, result: {result}, payload: {payload}")
-        mon_id = result["monitorID"]
-        kuma_monitor = api.get_monitor(id_=mon_id)
-      except Exception as e:
-        logger.error(f"Error creating monitor '{name}': {e}")
-        logger.debug(f"Error creating monitor '{name}', payload: {payload}, exception: {e}")
-
-    if kuma_monitor is not None and kuma_monitor.get('name') not in monitors_paused:
-      try:
-        result = api.resume_monitor(mon_id)
-        logger.debug(f'resume monitor {name}: {result}')
-      except Exception as e:
-        logger.exception(f'resume monitor: {payload["name"]}, error: {e}')
-
-    logger.info(f"Import completed for '{name}'.")
-
-    # All monitors are processed
-
-    # handle tags
-    # restore tags from config
-    m['tags'] = payload_tags
-    update_monitor_tags(api=api, monitor_id=mon_id, monitor=m, kuma_monitor=kuma_monitor, existing_tags=new_tags_id,
-                        delete=delete)
-  logger.debug(f'result: {result}, id_tags: {id_tags}')
-
-  # handle paused monitor
-  result = processed_monitors_paused(api=api, monitors_paused=monitors_paused, dry_run=dry_run)
-
-  # resume all paused groups
-  for g in new_groups:
-    try:
-      result = api.resume_monitor(new_groups[g].get('id'))
-    except Exception as e:
-      logger.exception(f'Cannot resume group {new_groups[g].get('name')}: ${result}')
-
-  # add/edit/delete maintenance: has to after all monitors add/edit/delete
-  existing_maintenance = api.get_maintenances()
-  new_maintenance = process_maintenance(api=api, existing_maintenance=existing_maintenance,
-                                        config_maintenance=config_maintenance,
-                                        existing_groups=existing_groups,
-                                        existing_monitors=existing_monitors, delete=delete)
-
-  logger.debug(f'new_maintenance: {new_maintenance}')
-
-# handle tags
+# =============================================================================
+# FUNCTION : update_monitor_tags
+# =============================================================================
 def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=None, kuma_monitor=None,
                         existing_tags=None, delete: bool = False) -> None:
   """
@@ -998,9 +1393,10 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
   add_tags = set(add_tags)
 
   # tags to remove
-  delete_tags = [t['tag_id'] for t in kuma_monitor['tags'] if t['tag_id'] not in existing_tags]
+  tags = kuma_monitor.get('tags', [])
+  delete_tags = [t['tag_id'] for t in tags if 'tag_id' in t and t['tag_id'] not in existing_tags]
   # duplicate tags
-  c = Counter([k['tag_id'] for k in kuma_monitor['tags']])
+  c = Counter([k['tag_id'] for k in tags])
   duplicates_to_remove = {k: v for k, v in c.items() if v > 1}
   if len(duplicates_to_remove) > 0:
     logger.info(f'duplicate tags found: {duplicates_to_remove}')
@@ -1021,7 +1417,7 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
 
   #
   for tag in add_tags:
-    if tag not in [k['tag_id'] for k in kuma_monitor['tags']]:
+    if tag not in [k['tag_id'] for k in tags]:
       try:
         result = api.add_monitor_tag(tag_id=tag, monitor_id=monitor_id)
         logger.info(f"Adding tag '{tag}' to monitor {monitor_id}, result: {result['msg']}")
@@ -1030,8 +1426,391 @@ def update_monitor_tags(api: UptimeKumaApi = None, monitor_id: int = 0, monitor=
         logger.error(f'error adding tag {tag} to monitor {monitor_id}: {e}')
 
 
-# ----------------------------------------------------------
-# TODO: tested
+# =============================================================================
+# FUNCTION : replace_tag_names_with_id
+# =============================================================================
+def replace_tag_names_with_id(config_tags: list[str], existing_tags: Dict[str, Any]) -> list[int]:
+  tags_id = []
+  for ctag in config_tags:
+    if ctag in existing_tags:
+      tags_id.append(existing_tags[ctag]['id'])
+
+  tags_id2 = [existing_tags[ctag]['id'] for ctag in config_tags if ctag in existing_tags.keys()]
+  logger.debug(f'tags_id2: {tags_id2}, tags_id: {tags_id}')
+  return tags_id
+
+
+# =============================================================================
+# FUNCTION : convert_time_range
+# =============================================================================
+def convert_time_range(thismaintenance) -> Dict[str, Any]:
+  if 'timeRange' not in thismaintenance.keys():
+    return thismaintenance
+
+  new_time_range = []
+  for elt in thismaintenance["timeRange"]:
+    splitted = elt.split(':')
+    new_time_range.append({"hours": int(splitted[0]), "minutes": int(splitted[1]), "seconds": int(splitted[2])})
+  thismaintenance['timeRange'] = new_time_range
+
+  if 'dateRange' not in thismaintenance:
+    thismaintenance['dateRange']=["",""]
+
+  return thismaintenance
+
+
+# =============================================================================
+# FUNCTION : process_maintenance
+# =============================================================================
+def process_maintenance(api: UptimeKumaApi = None, existing_maintenance: Dict[str, Any] = {},
+                        config_maintenance: List[Dict[str, Any]] = [],
+                        existing_groups: Dict[str, Any] = {},
+                        existing_monitors: Dict[str, Any] = {},
+                        delete: bool = False) -> Dict[str, Any]:
+  """
+  add/edit/delete maintenance
+  update monitors attached to a maintenance
+  :param api:
+  :param existing_maintenance:
+  :param config_maintenance:
+  :param existing_monitors:
+  :param delete:
+  :return:
+  """
+
+  # check parameters
+  if api is None:
+    raise ValueError("api must not be None")
+
+  if existing_maintenance is None:
+    existing_maintenance = []
+
+  if config_maintenance is None:
+    config_maintenance = []
+
+  if existing_groups is None:
+    existing_groups = {}
+
+  if existing_monitors is None:
+    existing_monitors = {}
+
+  config_maintenance_dict = {t['title']: t for t in config_maintenance}
+  config_maintenance_names = [t['title'] for t in config_maintenance]
+  existing_maintenance_dict = {t['title']: t for t in existing_maintenance}
+  existing_maintenance_names = [t['title'] for t in existing_maintenance]
+  existing_groups_names = [v['name'] for k, v in existing_groups.items()]
+
+  # remove duplicate existing maintenance
+  c = Counter(existing_maintenance_names)
+  logger.debug(f'maintenance counter: {c}')
+  duplicates = {k: v for k, v in c.items() if v > 1}
+  logger.info(f'duplicate maintenance found: {len(duplicates)}')
+  logger.debug(f'duplicate maintenance found: {len(duplicates)}, {duplicates}')
+
+  to_add = set(config_maintenance_names) - set(existing_maintenance_names)
+  to_delete = set(existing_maintenance_names) - set(config_maintenance_names)
+  to_edit = set(config_maintenance_names) & set(existing_maintenance_names)
+
+  added = []
+  deleted = []
+  edited = []
+  monitors_id_full_list = []
+  monitors_id_list = []
+
+  monitors = api.get_monitors()
+  existing_monitors_names = [v['name'] for k, v in existing_monitors.items()]
+
+  # add existing maintenance
+  for elt in to_add:
+    temp = [m for m in config_maintenance if m['title'] == elt]
+    if len(temp) < 1:
+      logger.warning(f'maintenance {elt} not found in config_maintenance')
+      continue
+
+    thismaintenance = convert_time_range(temp[0])
+
+    # extract monitor list id
+    if 'monitorslist' in thismaintenance:
+      monitors_list = thismaintenance.pop('monitorslist', ['all'])
+      excluded_names = thismaintenance.pop('excluded', [])
+      # if parent is in excluded, exclude child
+      excluded = [existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names]
+      # if current name is in excluded, exclude current
+      excluded_child = [v['id'] for k, v in existing_monitors.items() if v['name'] in excluded_names]
+      excluded.extend(excluded_child)
+
+      monitors_id_list = filter_monitors_for_maintenance(monitors=monitors, monitors_list=monitors_list,
+                                                         excluded=excluded, excluded_names=excluded_names,
+                                                         existing_groups=existing_groups,
+                                                         existing_monitors=existing_monitors)
+    # add maintenance
+    result = api.add_maintenance(**thismaintenance)
+    id = result.get('maintenanceID')
+    msg = result.get('msg')
+    if id is None or msg != "Added":
+      logger.error(f"Maintenance creation failed: {result}")
+      continue
+    logger.info(f"Adding maintenance '{elt}', id={id}, result: {result['msg']}")
+    logger.debug(f"Adding maintenance '{elt}', id={id}, result: {result}")
+    thismaintenance['id']=id
+    existing_maintenance_dict[elt] = thismaintenance
+    added.append(elt)
+
+    # update monitors association
+    for l in monitors_id_list:
+      monitors_id_full_list.append({'id': l})
+    result = api.add_monitor_maintenance(id_=id, monitors=monitors_id_full_list)
+    logger.info(
+      f"Adding {len(monitors_id_full_list)} monitors to maintenance '{elt}', id={id}, result: {result['msg']}")
+    logger.debug(f"Adding monitors {monitors_id_full_list} to maintenance '{elt}', id={id}, result: {result}")
+
+  # edit existing maintenance
+  for elt in to_edit:
+    id = existing_maintenance_dict[elt]['id']
+    thismaintenance = [m for m in config_maintenance if m['title'] == elt][0]
+    thismaintenance = convert_time_range(thismaintenance)
+
+    # extract monitor list id
+    if 'monitorslist' in thismaintenance:
+      monitors_list = thismaintenance.pop('monitorslist', [])
+      excluded_names = thismaintenance.pop('excluded', [])
+      # if parent is in excluded, exclude child
+      excluded = [existing_groups[e]['id'] for e in excluded_names if e in existing_groups_names]
+      # if current name is in excluded, exclude current
+      excluded_child = [v['id'] for k, v in existing_monitors.items() if v['name'] in excluded_names]
+      excluded.extend(excluded_child)
+
+      monitors_id_list = filter_monitors_for_maintenance(monitors=monitors, monitors_list=monitors_list,
+                                                         excluded=excluded, excluded_names=excluded_names,
+                                                         existing_groups=existing_groups,
+                                                         existing_monitors=existing_monitors)
+
+    # edit maintenance
+    try:
+      result = api.edit_maintenance(id=id, **thismaintenance)
+      # Vérifier que maintenanceID existe dans le résultat
+      if "maintenanceID" not in result:
+        maintenance_name = thismaintenance.get("name", thismaintenance.get("title", "unknown"))
+        raise ConfigError(
+          f"Maintenance edit failed: maintenanceID not in result for '{maintenance_name}'. "
+          f"Result: {result}"
+        )
+      logger.info(f"Editing maintenance '{elt}', id={id}, result: {result.get('msg', '')}")
+      logger.debug(
+        f'Editing maintenance "{elt}", id={str(id) + "/" + str(result.get("maintenanceID", "unkown"))}, result: {result}')
+      edited.append(elt)
+    except ConfigError:
+      # Relancer les erreurs de configuration
+      raise
+    except Exception as e:
+      maintenance_name = thismaintenance.get("name", thismaintenance.get("title", "unknown"))
+      logger.error(f'Error editing maintenance: {maintenance_name}, error: {str(e)}')
+      result = {}
+
+    # update monitors association
+    # TODO delete if existing ?
+    # current_monitors= api.get_monitor_maintenance(id_=id)
+    # current_monitors_id = [ c['id'] for c in current_monitors ]
+    # to_delete = monitors_id_list - current_monitors_id
+    # result = api.
+    monitors_id = []
+    for l in monitors_id_list:
+      monitors_id.append({'id': l})
+    result = api.add_monitor_maintenance(id_=id, monitors=monitors_id)
+    logger.info(f"Adding {len(monitors_id)} monitors to maintenance '{elt}', id={id}, result: {result['msg']}")
+    logger.debug(f"Adding monitors {monitors_id} to maintenance '{elt}', id={id}, result: {result}")
+
+  # if required, maintenance is deleted
+  if delete and len(to_delete) > 0:
+    for elt in to_delete:
+      # CORRECTION BUG: Vérifier que l'élément existe avant d'accéder à [0]
+      maintenance_info = existing_maintenance_dict.get(elt)
+      if maintenance_info is None:
+        logger.warning(f"Maintenance '{elt}' not found in existing maintenance, skipping deletion")
+        continue
+      maintenance_id = maintenance_info.get('id')
+      if maintenance_id is None:
+        logger.warning(f"Maintenance '{elt}' has no 'id' field, skipping deletion")
+        continue
+      result = api.delete_maintenance(id_=maintenance_id)
+      logger.info(f"Deleting removed maintenance '{elt}', id={maintenance_id}, result: {result.get('msg', '')}")
+      logger.debug(f"Deleting removed maintenance '{elt}', id={maintenance_id}, result: {result}")
+      deleted.append(elt)
+      existing_maintenance_dict.pop(elt, None)
+
+  logger.info(f'added: {len(added)}, deleted: {len(deleted)}, edited: {len(edited)}')
+  logger.debug(f'added: {added}, deleted: {deleted}, edited: {edited}')
+
+  return existing_maintenance_dict
+
+
+# =============================================================================
+# FUNCTION : filter_monitors_for_maintenance
+# =============================================================================
+def filter_monitors_for_maintenance(
+        monitors: List[Dict[str, Any]],
+        monitors_list: List[str],
+        excluded: List[int],
+        excluded_names: List[str],
+        existing_groups: Dict[str, Dict[str, Any]],
+        existing_monitors: Dict[str, Dict[str, Any]]
+) -> List[int]:
+  """
+  Filter monitors for maintenance according to inclusion/exclusion rules.
+
+  Args:
+      monitors: all monitors list
+      monitors_list: monitors to include (ou ['all'])
+      excluded: list of ID (groups/monitors) to exclude
+      excluded_names: monitors names to exclude from maintenance
+      existing_groups: Groupes existants
+      existing_monitors: Moniteurs existants
+
+  Returns:
+      IDs list of filtered monitors
+  """
+  if not monitors_list:
+    return []
+
+  # if monitors_list is 'all', include all but excluded
+  if monitors_list and str(monitors_list[0]).lower() == 'all':
+    return [
+      l['id'] for l in monitors
+      if l.get('parent') not in excluded and l['id'] not in excluded
+    ]
+
+  # else, include only monitors in the list
+  return [
+    l['id'] for l in monitors
+    if l['name'] in monitors_list
+       and l.get('parent') not in excluded
+       and l['id'] not in excluded
+  ]
+
+
+# =============================================================================
+# FUNCTION : associate_monitors_with_maintenance
+# =============================================================================
+def associate_monitors_with_maintenance(
+        api: UptimeKumaApi,
+        maintenance_id: int,
+        monitors_id_list: List[int],
+        maintenance_title: str
+) -> None:
+  """
+  Associe une liste de moniteurs à une maintenance.
+
+  Args:
+      api: Instance de l'API
+      maintenance_id: ID de la maintenance
+      monitors_id_list: Liste des IDs de moniteurs
+      maintenance_title: Titre de la maintenance (pour le logging)
+  """
+  if not monitors_id_list:
+    logger.debug(f"No monitors to associate with maintenance '{maintenance_title}'")
+    return
+
+  monitors_id = [{'id': mid} for mid in monitors_id_list]
+  result = api.add_monitor_maintenance(id_=maintenance_id, monitors=monitors_id)
+  logger.info(
+    f"Associated {len(monitors_id)} monitors with maintenance "
+    f"'{maintenance_title}', id={maintenance_id}, result: {result.get('msg', '')}"
+  )
+
+
+# =============================================================================
+# FUNCTION : processed_monitors_paused
+# =============================================================================
+def processed_monitors_paused(api: 'UptimeKumaApi', monitors_paused: list[str], dry_run: bool = True):
+  if api is None:
+    raise ValueError("api must not be None")
+  if len(monitors_paused) == 0:
+    return
+  try:
+    kuma_monitors = api.get_monitors()
+  except Exception as e:
+    logger.exception(f'Cannot get monitors: {e}')
+
+  monitor_paused_id = [(k.get('id'), k.get('name')) for k in kuma_monitors if k.get('name') in monitors_paused]
+  for id, name in monitor_paused_id:
+    try:
+      result = api.pause_monitor(id)
+      logger.info(f'Monitor {name} ({id}): {result['msg']}')
+    except Exception as e:
+      logger.error(f'pause_monitor {id}, {name}: {e}')
+
+
+# =============================================================================
+# FUNCTION : import_config_into_kuma
+# =============================================================================
+def import_config_into_kuma(file_path: str, api: 'UptimeKumaApi' = None, dry_run: bool = False,
+                            delete: bool = False) -> None:
+  """
+  import toml config into uptimekuma
+  :param file_path: toml config file path
+  :param api: UptimeKumaApi
+  :param dry_run: if true do not import
+  :param delete: if true, delete monitors not present in toml files
+
+  Handle configuration import into UptimeKuma api.
+
+  :raises:
+    ValueError: if api is None
+    ConfigError: if configuration is invalid
+    APIError: when using uptimeKuma api
+
+  Note:
+  this function has no return value, but raise an exception if an error occurs
+  """
+
+  # step 1: loading and validating configuration
+  logger.info(f"Loading configuration from {file_path}")
+  imported_config = load_toml(file_path)
+
+  # fetch 2: Fetch current state
+  logger.info("Fetching existing state from API")
+  existing = fetch_existing_state(api)
+
+  # step 3 : Traitement des entités indépendantes (status_pages, tags, notifications, groups, docker)
+  logger.info("Processing independent entities")
+  processed = process_independent_entities(api=api, config=imported_config, existing=existing, delete=delete)
+
+  # step 4 : replace references by names (groupes, docker hosts, notifications)
+  logger.info("Resolving references")
+  resolve_all_references(imported_config, processed)
+
+  # step 5 : Traitement des moniteurs
+  logger.info("Processing monitors")
+  monitors_paused, monitor_processed = process_all_monitors(
+    api=api,
+    config=imported_config,
+    existing=existing,
+    processed=processed,
+    delete=delete,
+    dry_run=dry_run
+  )
+
+  # Étape 6 : Finalisation
+  logger.info("Finalizing import")
+  finalize_import(
+    api=api,
+    config=imported_config,
+    existing=existing,
+    processed=processed,
+    monitors_paused=monitors_paused,
+    dry_run=dry_run,
+    delete=delete
+  )
+
+  logger.info("Configuration import completed successfully")
+
+  # add/edit/delete containers
+  # TODO
+
+
+# =============================================================================
+# utils : reformat monitors
+# =============================================================================
 
 def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[str, dict]]:
   """
@@ -1048,21 +1827,26 @@ def get_monitors(api: UptimeKumaApi | None) -> tuple[list[dict[Any, Any]], dict[
   except Exception as e:
     logger.error(f"Failed to fetch existing monitors: {e}")
     api.disconnect()
-    sys.exit(5)
+    raise DataFetchError(f"Failed to fetch existing monitors: {e}") from e
   return existing_config, existing_monitors
 
 
+# =============================================================================
+# utils : reformat tags
+# =============================================================================
+
 def get_tags(api: UptimeKumaApi | None) -> list[Any] | tuple[list[Any], dict[Any, dict]]:
-  if api is None:
-    return []
   existing_tags = []
   existing_tags_id = {}
+
+  if api is None:
+    return existing_tags, existing_tags_id
 
   try:
     existing_tags = api.get_tags()
   except Exception as e:
     logger.error(f"Failed to get existing tags: {e}")
-    sys.exit(5)
+    raise DataFetchError(f"Failed to fetch existing tags: {e}") from e
 
   existing_tag_names = list([t['name'] for t in existing_tags])
   existing_tags_id = {t['id']: t for t in existing_tags}
@@ -1075,32 +1859,26 @@ def get_tags(api: UptimeKumaApi | None) -> list[Any] | tuple[list[Any], dict[Any
   return existing_tags, existing_tags_id
 
 
-def load_toml_config_file(file_path: str) -> tuple[
-  Exception, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-  e = None
-  monitors = []
-  notifications = []
-  docker = []
-  maintenances = []
-
-  if not Path(file_path).is_file():
-    logger.error(f"File path '{file_path}' not found.")
-  try:
-    docker, monitors, notifications, maintenances, statuses = load_toml(file_path)
-  except (ConfigError, Exception) as e:
-    logger.error(f"Configuration error: {e}")
-    sys.exit(1)
-  return e, docker, monitors, notifications, maintenances, statuses
-
+# =============================================================================
+# main
+# =============================================================================
 
 def main():
+  """
+  Main entrypoint.
+   - Configure proprement le logger
+  - Gère les erreurs de manière cohérente
+  - Retourne des codes de sortie standard
+  """
+
   # set logger
-  format = '%(asctime)s - %(levelname)s - %(name)s [%(funcName)s][%(lineno)d] - %(message)s'
-  formatter = logging.Formatter(format)
-  logging.basicConfig(format=format, level=logging.INFO)
+  format_str = '%(asctime)s - %(levelname)s - %(name)s [%(funcName)s][%(lineno)d] - %(message)s'
+  formatter = logging.Formatter(format_str)
+  logging.basicConfig(format=format_str, level=logging.INFO)
   logger = logging.getLogger(__name__)
   logger.setLevel(logging.INFO)
 
+  # Args parsing
   p = argparse.ArgumentParser(description="Import monitors from TOML into UptimeKuma via UptimeKumaApi")
   p.add_argument("--file", "-f", help="TOML file path", default="kuma.toml")
   p.add_argument("--api-url", "-a", help="UptimeKuma API URL or connection string", default="http://localhost:3001")
@@ -1114,14 +1892,17 @@ def main():
                  default=False, action="store_true")
   args = p.parse_args()
 
-  log_level = logging.DEBUG if args.verbose else logging.INFO
+  # args processing
+  log_level = logging.INFO
+  if args.verbose:
+    log_level = logging.DEBUG
 
   if args.username and not args.password:
     logger.error("When using --username you must provide --password.")
-    sys.exit(1)
+    raise ConfigError(f'When using --username you must provide --password')
   if args.password and not args.username:
     logger.error("When using --password you must provide --username.")
-    sys.exit(1)
+    raise ConfigError(f'When using --password you must provide --username.')
 
   if args.logfile:
     # shandler = logging.StreamHandler(sys.stdout)
@@ -1136,36 +1917,65 @@ def main():
 
   logger.setLevel(log_level)
 
+  # Initialisation API
+  api = None
+  exit_code = 0
+  token = ""
+
   ssl_true = True if args.api_url.startswith("https://") else False
   try:
     api = UptimeKumaApi(url=args.api_url, ssl_verify=ssl_true, timeout=20)
+
+    if args.token:
+      token = args.token
+
+    token = get_token_from_kuma_api(kuma_api=api, token=token, username=args.username, password=args.password)
+    logger.debug(f'token: {token}')
+
+    if token is None:
+      logger.error(f'Error while operating with a token on api')
+      raise APIError("Failed to authenticate with UptimeKuma API")
+
+    result = api.get_database_size()
+    logger.info(f'Database size: {result["size"]}')
+    result = api.need_setup()
+    logger.info(f'need setup: {result}')
+    result = api.info()
+    logger.info(f'info: {result}')
+    # result = api.uptime()
+    # logger.info(f'uptime: {result}')
+
+    import_config_into_kuma(api=api, file_path=CDIR + os.sep + args.file, dry_run=args.dry_run, delete=args.delete)
+
+    logger.info("Import completed successfully")
+    exit_code = 0
+
+  except ConfigError as e:
+    logger.error(f"Configuration error: {e}")
+    exit_code = 1
+
+  except APIError as e:
+    logger.error(f"API error: {e}")
+    exit_code = 2
+
+  except KumaLoadError as e:
+    logger.error(f"Import error: {e}")
+    exit_code = 3
+
   except Exception as e:
-    logger.error(f'{args.api_url}: {e}')
-    sys.exit(1)
+    logger.exception(f"Unexpected error: {e}")
+    exit_code = 4
 
-  if args.token:
-    token = args.token
-  else:
-    token = get_token_from_kuma_api(kuma_api=api, username=args.username, password=args.password)
-  logger.debug(f'token: {token}')
+  finally:
+    if api is not None:
+      try:
+        result = api.disconnect()
+        logger.debug(f'result: {result}')
 
-  if token is None:
-    logger.error(f'Error while operating with a token on api')
-    sys.exit(1)
+      except Exception as e:
+        logger.warning(f"Error disconnecting API: {e}")
 
-  result = api.get_database_size()
-  logger.info(f'Database size: {result["size"]}')
-  result = api.need_setup()
-  logger.info(f'need setup: {result}')
-  result = api.info()
-  logger.info(f'info: {result}')
-  # result = api.uptime()
-  # logger.info(f'uptime: {result}')
-
-  import_config_into_kuma(api=api, file_path=CDIR + os.sep + args.file, dry_run=args.dry_run, delete=args.delete)
-
-  result = api.disconnect()
-  logger.debug(f'result: {result}')
+  sys.exit(exit_code)
 
 
 if __name__ == "__main__":

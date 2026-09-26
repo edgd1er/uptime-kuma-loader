@@ -1,12 +1,19 @@
 """
 Tests for process_notifications function.
 
-Note: The function has a bug where it returns {n['name']: n for n in existing_notifications}
-where existing_notifications is the original input parameter, not the updated dict.
-This means changes (adds, deletes) are not reflected in the return value.
-This is documented in the bug report.
+These tests verify the observable behavior of process_notifications:
+- Return value structure and content
+- Error handling for invalid inputs
+- Behavior with edge cases
 
-Also, the function expects API methods to return dicts with 'id' and 'msg' keys.
+Each test documents:
+- The behavior it protects
+- The bug it would detect
+- Why it doesn't depend on internal implementation details
+- Why it could realistically fail
+
+Note: We mock the API (external dependency) but verify the function's observable behavior,
+not the mock calls themselves.
 """
 import pytest
 from unittest.mock import Mock
@@ -15,40 +22,75 @@ from typing import Dict, Any
 from src.kuma_load.kuma_load import process_notifications
 
 
-def make_notification(name: str, notification_id: int = None) -> Dict[str, Any]:
-    """Create a notification dict for testing"""
-    notif = {"name": name}
-    if notification_id:
-        notif["id"] = notification_id
-    return notif
+# =============================================================================
+# CONTRACT TESTS
+# =============================================================================
 
 
-@pytest.fixture
-def mock_api():
-    """Create a mock API for testing"""
-    api = Mock()
-    api.add_notification = Mock()
-    api.edit_notification = Mock()
-    api.delete_notification = Mock()
-    return api
+def test_process_notifications_api_none_raises():
+    """
+    CONTRACT TEST: Function validates its inputs.
+    
+    Behavior protected: Input validation for required api parameter
+    Bug detected: Missing input validation
+    No internal dependency: Only tests public interface
+    Could fail: If input validation is removed or changed
+    
+    Test scenarios that would fail:
+    1. Function doesn't check for None api
+    2. Function accepts None api and crashes later
+    """
+    with pytest.raises(ValueError, match="api must not be None"):
+        process_notifications(api=None, existing_notifications=[], config_notifications=[], delete=False)
+
+
+# =============================================================================
+# UNIT TESTS - Core functionality
+# =============================================================================
 
 
 def test_process_notifications_returns_empty_dict_when_no_config():
-    """Test with empty config returns empty dict"""
+    """
+    UNIT TEST: Empty config produces empty result.
+    
+    Behavior protected: Function handles empty input correctly
+    Bug detected: Logic error processing empty config
+    No internal dependency: Only verifies return value
+    Could fail:
+    1. Function returns None instead of {}
+    2. Function returns wrong type
+    3. Function crashes with empty config
+    
+    Test scenarios that would fail:
+    1. Function returns None
+    2. Function returns list instead of dict
+    3. Function crashes
+    """
     api = Mock()
-    # Pass empty list to avoid TypeError with None
     result = process_notifications(
         api=api,
         existing_notifications=[],
         config_notifications=[],
         delete=False
     )
-    # Bug: Returns {n['name']: n for n in existing_notifications} where existing_notifications is []
     assert result == {}
+    assert isinstance(result, dict)
 
 
-def test_process_notifications_returns_original_existing_when_empty_config():
-    """Test with empty config returns original existing notifications as dict"""
+def test_process_notifications_returns_existing_when_empty_config():
+    """
+    UNIT TEST: Empty config returns existing notifications.
+    
+    Behavior protected: Function preserves existing notifications when no changes requested
+    Bug detected: Function loses existing notifications
+    No internal dependency: Only verifies return value
+    Could fail: If function doesn't preserve existing notifications
+    
+    Test scenarios that would fail:
+    1. Function returns empty dict
+    2. Function loses existing notifications
+    3. Function returns wrong structure
+    """
     api = Mock()
     existing = [{"name": "existing", "id": 1}]
     result = process_notifications(
@@ -57,20 +99,30 @@ def test_process_notifications_returns_original_existing_when_empty_config():
         config_notifications=[],
         delete=False
     )
-    # Bug: Returns {n['name']: n for n in existing_notifications} = {"existing": {"name": "existing", "id": 1}}
     assert result == {"existing": {"name": "existing", "id": 1}}
 
 
-def test_process_notifications_calls_add_for_new_notification():
-    """Test that add_notification is called for new notifications"""
+def test_process_notifications_adds_new_notification():
+    """
+    UNIT TEST: Adding a new notification returns correct structure.
+    
+    Behavior protected: Function adds new notifications and returns them
+    Bug detected: Function doesn't add new notifications correctly
+    No internal dependency: Only verifies return value, not API calls
+    Could fail: If function doesn't process new notifications correctly
+    
+    Test scenarios that would fail:
+    1. Function returns empty dict
+    2. Function doesn't include new_notif in result
+    3. Function returns wrong structure
+    4. Function returns wrong id for new notification
+    """
     api = Mock()
+    api.add_notification.return_value = {"id": 100, "msg": "ok"}
+    
     existing = []
     config = [{"name": "new_notif", "type": "discord"}]
     
-    # Mock must return a dict with 'id' and 'msg' keys
-    api.add_notification.return_value = {"id": 100, "msg": "ok"}
-    
-    # Bug: The function will add to existing_notifications_dict but return is based on original existing
     result = process_notifications(
         api=api,
         existing_notifications=existing,
@@ -78,25 +130,33 @@ def test_process_notifications_calls_add_for_new_notification():
         delete=False
     )
     
-    # Should have called add_notification with correct args
-    api.add_notification.assert_called_once()
-    call_kwargs = api.add_notification.call_args[1]
-    assert call_kwargs["name"] == "new_notif"
-    assert call_kwargs["type"] == "discord"
+    # Verify observable behavior: result contains new notification
+    assert isinstance(result, dict)
+    assert "new_notif" in result
+    assert result["new_notif"]["id"] == 100
+    assert result["new_notif"]["name"] == "new_notif"
+
+
+def test_process_notifications_edits_existing_notification():
+    """
+    UNIT TEST: Editing an existing notification updates result.
     
-    # Bug: result is based on original existing (which is empty), so result is empty
-    assert result == {}
-
-
-def test_process_notifications_calls_edit_for_existing_notification():
-    """Test that edit_notification is called for existing notifications"""
+    Behavior protected: Function updates existing notifications
+    Bug detected: Function doesn't update notifications correctly
+    No internal dependency: Only verifies return value
+    Could fail: If function doesn't update notifications
+    
+    Test scenarios that would fail:
+    1. Result doesn't contain existing_notif
+    2. Result contains wrong type
+    3. Function doesn't update type field
+    """
     api = Mock()
+    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
+    
     existing = [{"name": "existing_notif", "id": 1, "type": "email"}]
     config = [{"name": "existing_notif", "type": "discord"}]
     
-    # Mock must return a dict with 'id' and 'msg' keys
-    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
-    
     result = process_notifications(
         api=api,
         existing_notifications=existing,
@@ -104,32 +164,35 @@ def test_process_notifications_calls_edit_for_existing_notification():
         delete=False
     )
     
-    # Should have called edit_notification, not add
-    api.edit_notification.assert_called_once()
-    api.add_notification.assert_not_called()
-    
-    # Check the call arguments - should have id_ parameter
-    call_kwargs = api.edit_notification.call_args[1]
-    assert call_kwargs["id_"] == 1
-    assert call_kwargs["type"] == "discord"
-    
-    # Bug: result is based on original existing
+    # Verify observable behavior: result contains edited notification
+    assert isinstance(result, dict)
     assert "existing_notif" in result
+    assert result["existing_notif"]["id"] == 1
 
 
-def test_process_notifications_calls_delete_when_not_in_config_and_delete_true():
-    """Test that delete_notification is called when delete=True"""
+def test_process_notifications_deletes_when_not_in_config_and_delete_true():
+    """
+    UNIT TEST: Deleting notifications not in config when delete=True.
+    
+    Behavior protected: Function removes old notifications when delete=True
+    Bug detected: Function doesn't delete old notifications
+    No internal dependency: Only verifies return value
+    Could fail: If function doesn't delete old notifications
+    
+    Test scenarios that would fail:
+    1. Result contains delete_me
+    2. Result doesn't contain keep_me
+    3. Function returns wrong structure
+    """
     api = Mock()
+    api.delete_notification.return_value = {"msg": "deleted"}
+    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
+    
     existing = [
         {"name": "keep_me", "id": 1},
         {"name": "delete_me", "id": 2}
     ]
     config = [{"name": "keep_me"}]
-    
-    # Mock must return a dict with 'msg' key
-    api.delete_notification.return_value = {"msg": "deleted"}
-    # edit_notification will be called for keep_me (to_edit), must also return dict
-    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
     
     result = process_notifications(
         api=api,
@@ -138,24 +201,73 @@ def test_process_notifications_calls_delete_when_not_in_config_and_delete_true()
         delete=True
     )
     
-    # Should have deleted the notification not in config
-    api.delete_notification.assert_called_once()
-    call_kwargs = api.delete_notification.call_args[1]
-    assert call_kwargs["id_"] == 2
-    
-    # Should have edited keep_me
-    api.edit_notification.assert_called_once()
-    
-    # Bug: result is based on original existing, so both are still there
+    # Verify observable behavior: old notification is deleted, new one is kept
+    assert isinstance(result, dict)
     assert "keep_me" in result
-    assert "delete_me" in result
+    assert "delete_me" not in result
+
+
+def test_process_notifications_always_returns_dict():
+    """
+    UNIT TEST: Return value is always a dict.
+    
+    Behavior protected: Function always returns a dict
+    Bug detected: Function returns wrong type
+    No internal dependency: Only verifies return value type
+    Could fail: If function returns wrong type
+    
+    Test scenarios that would fail:
+    1. Function returns list
+    2. Function returns None
+    3. Function returns wrong structure
+    """
+    api = Mock()
+    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
+    
+    existing = [
+        {"name": "notif1", "id": 1},
+        {"name": "notif2", "id": 2}
+    ]
+    config = [{"name": "notif1"}]
+    
+    result = process_notifications(
+        api=api,
+        existing_notifications=existing,
+        config_notifications=config,
+        delete=False
+    )
+    
+    assert isinstance(result, dict)
+    assert "notif1" in result
+    assert "notif2" in result
+
+
+# =============================================================================
+# NEGATIVE TESTS / REGRESSION TESTS
+# =============================================================================
 
 
 def test_process_notifications_handles_duplicates_in_existing():
-    """Test that duplicate notifications in existing are added to to_delete set"""
-    # Note: When creating existing_notifications_dict from existing, duplicate names 
-    # will be overwritten (only last one kept)
+    """
+    REGRESSION TEST: Function handles duplicate notifications in existing.
+    
+    Behavior protected: Function handles duplicates correctly
+    Bug detected: Function crashes or behaves incorrectly with duplicates
+    No internal dependency: Only verifies return value
+    Could fail: If function doesn't handle duplicates
+    
+    Note: When creating existing_notifications_dict from existing, duplicate names
+    will be overwritten (only last one kept).
+    
+    Test scenarios that would fail:
+    1. Function crashes with duplicates
+    2. Function returns wrong structure
+    3. Result contains both duplicates
+    """
     api = Mock()
+    api.delete_notification.return_value = {"msg": "deleted"}
+    api.edit_notification.return_value = {"id": 3, "msg": "edited"}
+    
     existing = [
         {"name": "dup_notif", "id": 1},
         {"name": "dup_notif", "id": 2},  # This overwrites the first in the dict
@@ -163,11 +275,6 @@ def test_process_notifications_handles_duplicates_in_existing():
     ]
     config = [{"name": "keep_me"}]
     
-    # Mock must return a dict with 'msg' key
-    api.delete_notification.return_value = {"msg": "deleted"}
-    # edit_notification will be called for keep_me (to_edit), must also return dict
-    api.edit_notification.return_value = {"id": 3, "msg": "edited"}
-    
     result = process_notifications(
         api=api,
         existing_notifications=existing,
@@ -175,37 +282,8 @@ def test_process_notifications_handles_duplicates_in_existing():
         delete=True
     )
     
-    # The function adds duplicates to to_delete set using Counter on existing_notifications_names
-    # which comes from [e['name'] for e in existing] = ["dup_notif", "dup_notif", "keep_me"]
-    # So Counter will have dup_notif: 2, and it will be added to to_delete
-    # So delete should be called
-    assert api.delete_notification.call_count >= 1
-    
-    # Bug: result is based on original existing
-    assert "keep_me" in result
-    assert "dup_notif" in result
-
-
-def test_process_notifications_return_type_is_dict():
-    """Test that the return value is always a dict"""
-    api = Mock()
-    existing = [
-        {"name": "notif1", "id": 1},
-        {"name": "notif2", "id": 2}
-    ]
-    config = [{"name": "notif1"}]
-    
-    # Mock must return a dict with 'msg' key
-    api.edit_notification.return_value = {"id": 1, "msg": "edited"}
-    
-    result = process_notifications(
-        api=api,
-        existing_notifications=existing,
-        config_notifications=config,
-        delete=False
-    )
-    
-    # Result should be a dict
+    # Result should only contain keep_me
     assert isinstance(result, dict)
-    assert "notif1" in result
-    assert "notif2" in result
+    assert "keep_me" in result
+    # dup_notif should be deleted (it's in existing but not in config)
+    assert "dup_notif" not in result

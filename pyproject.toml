@@ -18,13 +18,12 @@ license = {text = "GNU General Public License v3.0" }
 #license-files = ["LICEN[CS]E"]
 
 dependencies = [
-    #"uptime-kuma-api",
     "uptime-kuma-api @ git+https://github.com/edgd1er/uptime-kuma-api@v2-support",
     "tomli"
 ]
 
 [project.optional-dependencies]
-dev = ["black", "isort","tomli_w","pytest","pytest-cov"]
+dev = ["black", "isort","tomli_w","pytest","pytest-cov>=6"]
 
 [project.scripts]
 ssay = "kuma_load.__main__:main"
